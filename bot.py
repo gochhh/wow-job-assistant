@@ -999,7 +999,7 @@ async def apply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "dynamic_or_login": "Formularz jest ładowany dynamicznie albo wymaga logowania.",
                 "too_large": "Strona formularza przekracza limit odczytu.",
             }.get(scan_status, "Nie udało się odczytać publicznego formularza.")
-            await status_message.edit_text(translate_ui_text(reason + " Bot nie poprosi Cię o ręczne wklejanie pytań; otwórz formularz samodzielnie:", language) + "\n" + url)
+            await status_message.edit_text(translate_ui_text(reason + "\n\n" + translate_ui_text("Bot nie poprosi Cię o ręczne wklejanie pytań; otwórz formularz samodzielnie:", language), language) + "\n" + url)
             continue
         await status_message.edit_text(translate_ui_text("Odczytałem pola formularza. Przygotowuję odpowiedzi na podstawie profilu…", language))
         try:
