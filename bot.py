@@ -23,7 +23,7 @@ from telegram.ext import (
 )
 
 from bot_language import (
-    AUTO_LANGUAGE_LABEL, BOT_COMMAND_DESCRIPTIONS, INFO_TEXT, LANGUAGE_NAMES, LANGUAGE_PROMPT,
+    AUTO_LANGUAGE_LABEL, BOT_COMMAND_DESCRIPTIONS, INFO_TEXT, LANGUAGE_AUTO_TEXT, LANGUAGE_NAMES, LANGUAGE_PROMPT,
     LANGUAGE_SET_TEXT, MENU_ACTIONS, MENU_LABELS, MENU_ROW_LAYOUT, PROFILE_ACTION_LABELS,
     START_TEXT, SUPPORTED_LANGUAGES, language_for_chat, language_for_user, localize_markup,
     commands_for_language, format_ui, normalize_language, remember_telegram_language, set_user_language, translate_ui_text,
