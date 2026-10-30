@@ -179,6 +179,10 @@ class CandidateProfile(StrictModel):
     work_preferences: list[str]
     questions_for_candidate: list[str]
     supplemental_information: list[str] = Field(default_factory=list)
+    preferred_work_mode: str | None = None
+    preferred_cities: list[str] = Field(default_factory=list)
+    preferred_contract_types: list[str] = Field(default_factory=list)
+    salary_expectation: str | None = None
 
 
 def split_telegram_text(text: str, max_chars: int = 3800) -> list[str]:
@@ -641,10 +645,31 @@ def profile_preview(profile: CandidateProfile, language: str = "pl") -> str:
         _display_list("Certyfikaty", profile.certifications),
         _display_list("Najważniejsze projekty", profile.project_highlights),
         _display_list("Preferencje", profile.work_preferences),
+        _display_list("Preferowany tryb pracy", [profile.preferred_work_mode] if profile.preferred_work_mode else []),
+        _display_list("Preferowane miasta", profile.preferred_cities),
+        _display_list("Preferowane typy umowy", profile.preferred_contract_types),
+        _display_list("Oczekiwania finansowe", [profile.salary_expectation] if profile.salary_expectation else []),
         _display_list("Informacje uzupełnione przez Ciebie", profile.supplemental_information),
         _display_list("Do potwierdzenia", profile.questions_for_candidate),
         "", "Sprawdź dane. Zapis nastąpi dopiero po wybraniu „Zatwierdź i zapisz”.",
     ])
+    return "\n".join(lines)
+
+
+def profile_category_summary(profile: CandidateProfile, language: str) -> str:
+    categories = [
+        ("Dane kontaktowe", [profile.full_name, profile.email, profile.phone, profile.location_city_country]),
+        ("Doświadczenie zawodowe", [profile.professional_headline, profile.years_of_experience, *[item.role for item in profile.work_experience]]),
+        ("Kompetencje i branże", [*profile.skills, *profile.industries]),
+        ("Edukacja i certyfikaty", [*[item.degree or item.institution for item in profile.education], *profile.certifications]),
+        ("Języki", profile.languages),
+        ("Preferencje wyszukiwania", [profile.preferred_work_mode, *profile.preferred_cities, *profile.preferred_contract_types, profile.salary_expectation]),
+    ]
+    lines = [translate_ui_text("Kategorie profilu", language)]
+    for title, values in categories:
+        present = [str(value) for value in values if value and str(value).strip()]
+        state = ", ".join(present[:4]) if present else translate_ui_text("Do uzupełnienia", language)
+        lines.append(f"• {translate_ui_text(title, language)}: {state}")
     return "\n".join(lines)
 
 
@@ -753,7 +778,9 @@ async def show_selected_profile(query, profile_id: str, language: str) -> None:
         [InlineKeyboardButton(translate_ui_text("Używaj do wyszukiwania ofert", language), callback_data=f"profile:use:{profile_id}")],
         [InlineKeyboardButton(translate_ui_text("🔙 Lista profili", language), callback_data="profile:list")],
     ])
-    await query.edit_message_text(format_ui("selected_profile", language, name=name), reply_markup=keyboard)
+    profile = CandidateProfile.model_validate(record[1]["profile"])
+    text = format_ui("selected_profile", language, name=name) + "\n\n" + profile_category_summary(profile, language)
+    await query.edit_message_text(text, reply_markup=keyboard)
 
 
 async def cvs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -814,13 +841,25 @@ async def _begin_profile_supplement(target, context: ContextTypes.DEFAULT_TYPE, 
             await target.reply_text(error_text)
         return
     profile = CandidateProfile.model_validate(record[1]["profile"])
-    questions = chr(10).join(f"• {question}" for question in profile.questions_for_candidate)
+    working = profile.model_dump(mode="json")
+    steps: list[dict[str, str]] = []
+    if not profile.preferred_work_mode:
+        steps.append({"field": "preferred_work_mode", "question": "Jaki tryb pracy preferujesz: zdalny, hybrydowy czy stacjonarny? Możesz odpowiedzieć „dowolny”."})
+    if not profile.preferred_cities:
+        steps.append({"field": "preferred_cities", "question": "W jakich miastach chcesz pracować stacjonarnie lub hybrydowo? Wpisz miasta oddzielone przecinkami albo „pomiń”."})
+    if not profile.preferred_contract_types:
+        steps.append({"field": "preferred_contract_types", "question": "Jakie typy umowy preferujesz? Wpisz odpowiedź albo „pomiń”."})
+    if not profile.salary_expectation:
+        steps.append({"field": "salary_expectation", "question": "Jakie są Twoje oczekiwania finansowe? Wpisz kwotę i walutę albo „pomiń”."})
+    steps.extend({"field": "supplemental_information", "question": question} for question in profile.questions_for_candidate)
+    if not steps:
+        steps.append({"field": "supplemental_information", "question": "Jakie dodatkowe informacje mam dopisać do profilu? Możesz też wpisać „pomiń”."})
     context.user_data["flow"] = "profile_supplement"
     context.user_data["profile_supplement_target_id"] = profile_id
-    prompt = translate_ui_text("Wyślij brakujące informacje, które mam dopisać do profilu. Zapiszę je lokalnie.", language)
-    if questions:
-        prompt += chr(10) + chr(10) + translate_ui_text("CV wskazało do potwierdzenia:", language) + chr(10) + questions
-    prompt += chr(10) + translate_ui_text("Anuluj poleceniem /cancel.", language)
+    context.user_data["profile_supplement_working"] = working
+    context.user_data["profile_supplement_steps"] = steps
+    first = steps[0]
+    prompt = translate_ui_text(first["question"], language) + "\n\n" + translate_ui_text("Odpowiadaj po kolei. Wpisz „pomiń”, aby pominąć pytanie, albo /cancel, aby anulować.", language)
     if isinstance(target, CallbackQuery):
         await target.edit_message_text(prompt)
     else:
@@ -875,9 +914,16 @@ async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int)
         matching = ", ".join(fit.get("matching_requirements", [])) or "brak potwierdzonych dopasowań"
         gaps = ", ".join(fit.get("gaps", [])) or "brak wskazanych luk"
         title = str(offer.get("title") or "Oferta")
+        details = []
+        for label, key in (("Forma zatrudnienia", "employment_type"), ("Wynagrodzenie", "salary"), ("Tryb pracy", "work_mode")):
+            value = offer.get(key)
+            if value:
+                details.append(f"{translate_ui_text(label, _ui_language_from_message(message))}: {value}")
+        details_text = ("\n" + " | ".join(details)) if details else ""
         text = (
             f"{fit.get('color', '⚪')} Dopasowanie: {fit.get('score', 0)}%\n"
             f"{title}\n{offer.get('company') or 'Firma niepodana'} | {offer.get('location') or 'Lokalizacja niepodana'}\n"
+            f"{details_text}\n"
             f"Pasuje: {matching}\nBraki: {gaps}\n{fit.get('rationale', '')}\n{offer.get('url', '')}"
         )
         action = "job:remove:" if offer.get("id") in chosen else "job:add:"
@@ -924,7 +970,8 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
         await message.reply_text("Najpierw zapisz aktywny profil poleceniem /analyze.")
         return
     profile = active[2]
-    status = await message.reply_text("Rozpoczynam wyszukiwanie ofert na Pracuj.pl. Sprawdzę kolejne strony i zbliżone nazwy stanowisk.")
+    language = _ui_language_from_message(message)
+    status = await message.reply_text(translate_ui_text("Rozpoczynam wyszukiwanie ofert na Pracuj.pl. Sprawdzę kolejne strony i zbliżone nazwy stanowisk.", language))
     search_started = time.monotonic()
     terms = _job_search_terms(profile, query)
     try:
@@ -932,47 +979,74 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
         related_titles = await suggest_related_job_titles(profile.model_dump(mode="json"), _ui_language_from_message(message))
         terms = _job_search_terms(profile, query, related_titles)
     except Exception as exc:
-        LOGGER.error("Rozszerzenie nazw stanowisk nie powiodło się (%s); używam nazw z profilu.", type(exc).__name__)
+        LOGGER.exception("Rozszerzenie nazw stanowisk nie powiodło się; używam nazw z profilu (%s).", type(exc).__name__)
     offers_by_id: dict[str, object] = {}
     pages_scanned = 0
+    preferred_mode = (profile.preferred_work_mode or "").casefold()
+    if not preferred_mode:
+        preferences = " ".join(profile.work_preferences).casefold()
+        if any(token in preferences for token in ("zdal", "remote", "удал", "віддал")):
+            preferred_mode = "remote"
+        elif any(token in preferences for token in ("hyb", "hybrid", "гибрид", "гібрид")):
+            preferred_mode = "hybrid"
+        elif any(token in preferences for token in ("stacjon", "on-site", "onsite", "office", "стаціон")):
+            preferred_mode = "onsite"
+    if preferred_mode == "remote":
+        locations = [None]
+    elif location:
+        locations = [location]
+    elif profile.preferred_cities:
+        locations = profile.preferred_cities
+    elif preferred_mode in {"hybrid", "onsite"} and profile.location_city_country:
+        locations = [profile.location_city_country.split(",", 1)[0].strip()]
+    else:
+        locations = [None]
     try:
         for term_index, term in enumerate(terms, start=1):
-            seen_page_ids: set[frozenset[str]] = set()
-            portal_page = 0
-            while True:
-                portal_page += 1
-                try:
-                    page_offers = await asyncio.to_thread(fetch_pracuj_jobs, term, location, portal_page)
-                except RuntimeError as exc:
-                    if portal_page > 1 and "HTTP 404" in str(exc):
+            for search_location in locations:
+                seen_page_ids: set[frozenset[str]] = set()
+                portal_page = 0
+                while True:
+                    portal_page += 1
+                    try:
+                        page_offers = await asyncio.to_thread(fetch_pracuj_jobs, term, search_location, portal_page)
+                    except RuntimeError as exc:
+                        if portal_page == 1:
+                            LOGGER.warning("Pracuj.pl search request failed (term=%d/%d page=%d location=%s): %s", term_index, len(terms), portal_page, search_location or "all", str(exc))
+                        elif "HTTP 404" not in str(exc):
+                            LOGGER.warning("Pracuj.pl pagination stopped after %d pages (term=%d/%d location=%s): %s", portal_page - 1, term_index, len(terms), search_location or "all", str(exc))
                         break
-                    raise
-                pages_scanned += 1
-                current_ids = {str(item.id) for item in page_offers}
-                page_key = frozenset(current_ids)
-                if not page_offers or page_key in seen_page_ids:
-                    break
-                seen_page_ids.add(page_key)
-                for offer in page_offers:
-                    offers_by_id.setdefault(str(offer.id), offer)
-                if portal_page == 1 or portal_page % 3 == 0:
-                    await status.edit_text(format_ui("search_page_progress", _ui_language_from_message(message), pages=pages_scanned, count=len(offers_by_id)))
+                    pages_scanned += 1
+                    current_ids = {str(item.id) for item in page_offers}
+                    page_key = frozenset(current_ids)
+                    if not page_offers or page_key in seen_page_ids:
+                        break
+                    seen_page_ids.add(page_key)
+                    for offer in page_offers:
+                        mode = str(getattr(offer, "work_mode", None) or "").casefold()
+                        if preferred_mode == "remote" and mode == "onsite":
+                            continue
+                        if preferred_mode in {"hybrid", "onsite"} and mode == "remote":
+                            continue
+                        offers_by_id.setdefault(str(offer.id), offer)
+                    if portal_page == 1 or portal_page % 3 == 0:
+                        await status.edit_text(format_ui("search_page_progress", language, pages=pages_scanned, count=len(offers_by_id)))
 
         offers = list(offers_by_id.values())
         if not offers:
             save_search_results([])
-            await status.edit_text("Nie udało się pobrać ofert z Pracuj.pl. Portal może blokować automatyczny odczyt albo nie ma wyników dla tych stanowisk.")
+            await status.edit_text(translate_ui_text("Nie udało się pobrać ofert z Pracuj.pl. Portal może blokować automatyczny odczyt albo nie ma wyników dla tych stanowisk.", language))
             return
         all_ranked: list[dict[str, object]] = []
         batches = [offers[i:i + 5] for i in range(0, len(offers), 5)]
         for batch_index, batch in enumerate(batches, start=1):
-            await status.edit_text(format_ui("search_batch", _ui_language_from_message(message), count=len(offers), pages=pages_scanned, index=batch_index, total=len(batches)))
-            all_ranked.extend(await rank_jobs(profile.model_dump(mode="json"), batch, _ui_language_from_message(message)))
+            await status.edit_text(format_ui("search_batch", language, count=len(offers), pages=pages_scanned, index=batch_index, total=len(batches)))
+            all_ranked.extend(await rank_jobs(profile.model_dump(mode="json"), batch, language))
         all_ranked = [row for row in all_ranked if int(row.get("fit", {}).get("score", 0)) >= 60]
         all_ranked.sort(key=lambda row: int(row.get("fit", {}).get("score", 0)), reverse=True)
     except Exception as exc:
-        LOGGER.error("Wyszukiwanie ofert nie powiodło się (%s).", type(exc).__name__)
-        await status.edit_text("Nie udało się pobrać lub ocenić ofert. Sprawdź połączenie i spróbuj ponownie.")
+        LOGGER.exception("Wyszukiwanie ofert nie powiodło się (%s).", type(exc).__name__)
+        await status.edit_text(translate_ui_text("Nie udało się pobrać lub ocenić ofert. Sprawdź połączenie i spróbuj ponownie.", language))
         return
     context.user_data["job_query"] = query
     context.user_data["job_location"] = location
@@ -980,7 +1054,7 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
     save_search_results(all_ranked)
     elapsed = time.monotonic() - search_started
     LOGGER.info("Pracuj search completed: terms=%d pages=%d offers=%d qualified=%d elapsed_seconds=%.2f", len(terms), pages_scanned, len(offers), len(all_ranked), elapsed)
-    await status.edit_text(format_ui("search_finished", _ui_language_from_message(message), pages=pages_scanned, count=len(offers), qualified=len(all_ranked), seconds=elapsed))
+    await status.edit_text(format_ui("search_finished", language, pages=pages_scanned, count=len(offers), qualified=len(all_ranked), seconds=elapsed))
     await _send_ranked_jobs(message, all_ranked, 1)
 
 
@@ -1094,28 +1168,58 @@ async def free_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     flow = context.user_data.get("flow")
     if flow == "profile_supplement":
         profile_id = context.user_data.get("profile_supplement_target_id")
-        target = get_profile_record(profile_id) if profile_id else get_profile_record()
-        if not target:
+        steps = context.user_data.get("profile_supplement_steps") or []
+        working = context.user_data.get("profile_supplement_working")
+        target = get_profile_record(profile_id) if profile_id else None
+        if not target or not isinstance(working, dict) or not steps:
             context.user_data.pop("flow", None)
             context.user_data.pop("profile_supplement_target_id", None)
+            context.user_data.pop("profile_supplement_steps", None)
+            context.user_data.pop("profile_supplement_working", None)
             await message.reply_text(translate_ui_text("Nie ma aktywnego profilu. Wyślij CV i uruchom /analyze.", _ui_language(update)))
             return
-        profile_id, record = target
-        profile = CandidateProfile.model_validate(record["profile"])
         value = (message.text or "").strip()
         if not value:
-            await message.reply_text(translate_ui_text("Wyślij tekstowe informacje do dopisania albo /cancel.", _ui_language(update)))
+            await message.reply_text(translate_ui_text("Wyślij odpowiedź tekstową albo /cancel.", _ui_language(update)))
             return
-        updated = profile.model_copy(deep=True)
-        updated.supplemental_information.append(value)
+        current = steps.pop(0)
+        skip = value.casefold() in {"pomiń", "pomin", "skip", "pass", "пропустить", "пропусти", "пропустити", "omitir", "ignorer", "überspringen"}
+        if not skip:
+            field = current["field"]
+            if field == "preferred_work_mode":
+                normalized = value.casefold()
+                if any(token in normalized for token in ("zdal", "remote", "удал", "дистанц", "віддал")):
+                    working[field] = "remote"
+                    steps = [step for step in steps if step["field"] != "preferred_cities"]
+                elif any(token in normalized for token in ("hyb", "гибрид", "гібрид")):
+                    working[field] = "hybrid"
+                elif any(token in normalized for token in ("stacjon", "office", "on-site", "onsite", "офис", "офіс", "стаціон")):
+                    working[field] = "onsite"
+                else:
+                    working[field] = value
+            elif field in {"preferred_cities", "preferred_contract_types"}:
+                working[field] = [part.strip() for part in re.split(r"[,;\n]+", value) if part.strip()]
+            elif field == "salary_expectation":
+                working[field] = value
+            else:
+                working.setdefault("supplemental_information", []).append(f"{current['question']} — {value}")
+        context.user_data["profile_supplement_steps"] = steps
+        context.user_data["profile_supplement_working"] = working
+        if steps:
+            prompt = translate_ui_text(steps[0]["question"], _ui_language(update)) + "\n\n" + translate_ui_text("Odpowiadaj po kolei. Wpisz „pomiń”, aby pominąć pytanie, albo /cancel, aby anulować.", _ui_language(update))
+            await message.reply_text(prompt)
+            return
+        updated = CandidateProfile.model_validate(working)
         context.user_data.pop("flow", None)
         context.user_data.pop("profile_supplement_target_id", None)
+        context.user_data.pop("profile_supplement_steps", None)
+        context.user_data.pop("profile_supplement_working", None)
         context.user_data["profile_supplement_draft"] = {"profile_id": profile_id, "profile": updated.model_dump(mode="json")}
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("Zapisz uzupełnienie", callback_data="profile_supplement:approve"),
-            InlineKeyboardButton("Anuluj", callback_data="profile_supplement:cancel"),
+            InlineKeyboardButton(translate_ui_text("Zapisz uzupełnienie", _ui_language(update)), callback_data="profile_supplement:approve"),
+            InlineKeyboardButton(translate_ui_text("Anuluj", _ui_language(update)), callback_data="profile_supplement:cancel"),
         ]])
-        await _send_split(message, profile_preview(updated, _ui_language_from_message(message)), keyboard)
+        await _send_split(message, profile_preview(updated, _ui_language_from_message(message)) + "\n\n" + profile_category_summary(updated, _ui_language_from_message(message)), keyboard)
         return
     await message.reply_text("Nie rozpoznałem oczekiwanej odpowiedzi. Użyj /start, aby zobaczyć dostępne polecenia.")
 
@@ -1180,6 +1284,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "profile_supplement:cancel":
         context.user_data.pop("profile_supplement_draft", None)
         context.user_data.pop("profile_supplement_target_id", None)
+        context.user_data.pop("profile_supplement_steps", None)
+        context.user_data.pop("profile_supplement_working", None)
         await query.edit_message_text(translate_ui_text("Anulowano. Zapisany profil nie został zmieniony.", language))
         return
     if data == "profile_supplement:approve":
@@ -1410,6 +1516,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("profile_draft_source", None)
     context.user_data.pop("profile_supplement_target_id", None)
     context.user_data.pop("profile_supplement_draft", None)
+    context.user_data.pop("profile_supplement_steps", None)
+    context.user_data.pop("profile_supplement_working", None)
     context.user_data.pop("flow", None)
     if update.effective_message:
         await update.effective_message.reply_text(

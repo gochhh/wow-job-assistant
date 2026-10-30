@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +54,9 @@ class JobOffer(StrictModel):
     url: str
     description: str = ""
     posted_at: str | None = None
+    employment_type: str | None = None
+    salary: str | None = None
+    work_mode: str | None = None
     source: str = "Pracuj.pl"
 
 
@@ -290,10 +294,47 @@ def _job_from_jsonld(item: dict[str, Any]) -> JobOffer | None:
         address = address[0] if address else {}
     locality = address.get("addressLocality") if isinstance(address, dict) else None
     description = _plain_text(str(item.get("description") or ""))
+    employment = item.get("employmentType")
+    if isinstance(employment, list):
+        employment = ", ".join(str(value) for value in employment if value)
+    employment = str(employment).strip() if employment else None
+    salary = None
+    base_salary = item.get("baseSalary")
+    if isinstance(base_salary, dict):
+        currency = base_salary.get("currency") or ""
+        value = base_salary.get("value", {})
+        if isinstance(value, dict):
+            minimum = value.get("minValue")
+            maximum = value.get("maxValue")
+            amount = value.get("value")
+            unit = value.get("unitText")
+            if minimum is not None and maximum is not None:
+                salary = f"{minimum}–{maximum} {currency} {unit or ''}".strip()
+            elif amount is not None:
+                salary = f"{amount} {currency} {unit or ''}".strip()
+        elif value is not None:
+            salary = f"{value} {currency}".strip()
+    if not salary:
+        salary_match = re.search(r"(?i)(?:od\s*)?\d[\d\s.,]*\s*(?:zł|PLN|EUR|USD)(?:\s*(?:brutto|netto))?(?:\s*(?:/|mies\.?|miesięcznie|godz\.?|h))?", description)
+        salary = salary_match.group(0).strip() if salary_match else None
+    location_type = str(item.get("jobLocationType") or "").casefold()
+    combined_text = f"{location_type} {description}".casefold()
+    if "telecommute" in location_type or any(term in combined_text for term in ("praca zdalna", "w pełni zdal", "remote work", "fully remote")):
+        work_mode = "remote"
+    elif any(term in combined_text for term in ("hybryd", "hybrid")):
+        work_mode = "hybrid"
+    elif any(term in combined_text for term in ("stacjonarn", "on-site", "onsite", "z biura")):
+        work_mode = "onsite"
+    else:
+        work_mode = None
     job_id = str(identifier or "")
     if not job_id:
         job_id = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
-    return JobOffer(id=job_id, title=title, company=company, location=locality, url=url, description=description[:12000], posted_at=item.get("datePosted"))
+    return JobOffer(
+        id=job_id, title=title, company=company, location=locality, url=url,
+        description=description[:12000], posted_at=item.get("datePosted"),
+        employment_type=employment, salary=salary, work_mode=work_mode,
+    )
 
 
 def build_search_url(query: str, location: str | None = None, page: int = 1) -> str:
@@ -313,17 +354,25 @@ def fetch_pracuj_jobs(query: str, location: str | None = None, page: int = 1) ->
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.7",
     })
-    try:
-        with urllib.request.urlopen(request, timeout=25) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Pracuj.pl zwrócił kod HTTP {response.status}.")
-            raw = response.read(8_000_000)
-            charset = response.headers.get_content_charset() or "utf-8"
-            markup = raw.decode(charset, errors="replace")
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Pracuj.pl zwrócił kod HTTP {exc.code}.") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise RuntimeError("Nie udało się połączyć z Pracuj.pl. Spróbuj ponownie później.") from exc
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Pracuj.pl zwrócił kod HTTP {response.status}.")
+                raw = response.read(8_000_000)
+                charset = response.headers.get_content_charset() or "utf-8"
+                markup = raw.decode(charset, errors="replace")
+                break
+        except urllib.error.HTTPError as exc:
+            if exc.code in {429, 500, 502, 503, 504} and attempt < 2:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            raise RuntimeError(f"Pracuj.pl zwrócił kod HTTP {exc.code}.") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt < 2:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            raise RuntimeError("Nie udało się połączyć z Pracuj.pl. Spróbuj ponownie później.") from exc
 
     parser = _OfferParser()
     parser.feed(markup)
