@@ -17,18 +17,28 @@ LANGUAGE_NAMES = {
 # Stable action IDs let button routing stay independent of the selected language.
 MENU_ACTIONS = (
     "profile", "search_jobs", "selected_jobs", "prepare_applications",
-    "bot_language", "help", "cancel",
+    "bot_language", "help", "cancel", "search_settings",
 )
 MENU_LABELS = {
-    "pl": ("👤 Mój profil", "🔎 Szukaj ofert", "⭐ Wybrane oferty", "📨 Przygotuj aplikacje", "🗣️ Język bota", "ℹ️ Informacje", "✖️ Anuluj operację"),
-    "en": ("👤 My profile", "🔎 Search jobs", "⭐ Selected jobs", "📨 Prepare applications", "🗣️ Bot language", "ℹ️ About", "✖️ Cancel operation"),
-    "ru": ("👤 Мой профиль", "🔎 Искать вакансии", "⭐ Избранные вакансии", "📨 Подготовить заявки", "🗣️ Язык бота", "ℹ️ О боте", "✖️ Отменить операцию"),
-    "uk": ("👤 Мій профіль", "🔎 Шукати вакансії", "⭐ Обрані вакансії", "📨 Підготувати заявки", "🗣️ Мова бота", "ℹ️ Про бота", "✖️ Скасувати операцію"),
-    "es": ("👤 Mi perfil", "🔎 Buscar ofertas", "⭐ Ofertas seleccionadas", "📨 Preparar solicitudes", "🗣️ Idioma del bot", "ℹ️ Información", "✖️ Cancelar operación"),
-    "fr": ("👤 Mon profil", "🔎 Rechercher des offres", "⭐ Offres sélectionnées", "📨 Préparer les candidatures", "🗣️ Langue du bot", "ℹ️ À propos", "✖️ Annuler l’opération"),
-    "de": ("👤 Mein Profil", "🔎 Stellen suchen", "⭐ Ausgewählte Stellen", "📨 Bewerbungen vorbereiten", "🗣️ Bot-Sprache", "ℹ️ Informationen", "✖️ Vorgang abbrechen"),
+    "pl": ("👤 Mój profil", "🔎 Szukaj ofert", "⭐ Wybrane oferty", "📨 Przygotuj aplikacje", "🗣️ Język bota", "ℹ️ Informacje", "✖️ Anuluj operację", "⚙️ Ustawienia wyszukiwania"),
+    "en": ("👤 My profile", "🔎 Search jobs", "⭐ Selected jobs", "📨 Prepare applications", "🗣️ Bot language", "ℹ️ About", "✖️ Cancel operation", "⚙️ Search settings"),
+    "ru": ("👤 Мой профиль", "🔎 Искать вакансии", "⭐ Избранные вакансии", "📨 Подготовить заявки", "🗣️ Язык бота", "ℹ️ О боте", "✖️ Отменить операцию", "⚙️ Настройки поиска"),
+    "uk": ("👤 Мій профіль", "🔎 Шукати вакансії", "⭐ Обрані вакансії", "📨 Підготувати заявки", "🗣️ Мова бота", "ℹ️ Про бота", "✖️ Скасувати операцію", "⚙️ Налаштування пошуку"),
+    "es": ("👤 Mi perfil", "🔎 Buscar ofertas", "⭐ Ofertas seleccionadas", "📨 Preparar solicitudes", "🗣️ Idioma del bot", "ℹ️ Información", "✖️ Cancelar operación", "⚙️ Ajustes de búsqueda"),
+    "fr": ("👤 Mon profil", "🔎 Rechercher des offres", "⭐ Offres sélectionnées", "📨 Préparer les candidatures", "🗣️ Langue du bot", "ℹ️ À propos", "✖️ Annuler l’opération", "⚙️ Paramètres de recherche"),
+    "de": ("👤 Mein Profil", "🔎 Stellen suchen", "⭐ Ausgewählte Stellen", "📨 Bewerbungen vorbereiten", "🗣️ Bot-Sprache", "ℹ️ Informationen", "✖️ Vorgang abbrechen", "⚙️ Sucheinstellungen"),
 }
-MENU_ROW_LAYOUT = ((0,), (1, 2), (3, 4), (5, 6))
+MENU_ROW_LAYOUT = ((0,), (1, 2), (3, 4), (7,), (5, 6))
+
+SEARCH_SETTINGS_TEXT = {
+    "pl": {"title":"Ustawienia wyszukiwania", "threshold":"Minimalny próg dopasowania: {threshold}%\nBędę pokazywać oferty z wynikiem równym lub wyższym. Zmieniaj próg co 5 punktów.", "back":"🔙 Menu główne", "returned":"Wrócono do menu głównego."},
+    "en": {"title":"Search settings", "threshold":"Minimum match threshold: {threshold}%\nI’ll show jobs with a score equal to or above this value. Adjust in 5-point steps.", "back":"🔙 Main menu", "returned":"Returned to the main menu."},
+    "ru": {"title":"Настройки поиска", "threshold":"Минимальный порог соответствия: {threshold}%\nБудут показаны вакансии с таким или более высоким результатом. Шаг изменения — 5 пунктов.", "back":"🔙 Главное меню", "returned":"Возврат в главное меню."},
+    "uk": {"title":"Налаштування пошуку", "threshold":"Мінімальний поріг відповідності: {threshold}%\nПоказуватиму вакансії з таким або вищим результатом. Крок зміни — 5 пунктів.", "back":"🔙 Головне меню", "returned":"Повернення до головного меню."},
+    "es": {"title":"Ajustes de búsqueda", "threshold":"Umbral mínimo de coincidencia: {threshold}%\nMostraré ofertas con una puntuación igual o superior. Ajusta en pasos de 5 puntos.", "back":"🔙 Menú principal", "returned":"Has vuelto al menú principal."},
+    "fr": {"title":"Paramètres de recherche", "threshold":"Seuil minimal de correspondance : {threshold}%\nLes offres affichées auront ce score ou un score supérieur. Réglage par pas de 5 points.", "back":"🔙 Menu principal", "returned":"Retour au menu principal."},
+    "de": {"title":"Sucheinstellungen", "threshold":"Mindestübereinstimmung: {threshold}%\nAngezeigt werden Stellen mit diesem oder einem höheren Wert. Änderung in 5-Punkte-Schritten.", "back":"🔙 Hauptmenü", "returned":"Zurück zum Hauptmenü."},
+}
 
 PROFILE_ACTION_LABELS = {
     "pl": {"complete":"✍️ Uzupełnij profil","manage":"📚 Zarządzaj CV","language":"🌐 Język profilu","delete":"🗑️ Usuń aktywny profil","back_main":"🔙 Menu główne","back_profile":"🔙 Wróć do profilu"},
@@ -128,14 +138,45 @@ def set_user_language(user_id: int, language: str | None) -> None:
     settings = _read_settings()
     users = settings.setdefault("users", {})
     key = str(user_id)
+    preference = users.setdefault(key, {})
+    if not isinstance(preference, dict):
+        preference = {}
+        users[key] = preference
     if language is None:
-        users.pop(key, None)
+        preference.pop("language", None)
     elif language in SUPPORTED_LANGUAGES:
-        users[key] = {"language": language}
+        preference["language"] = language
+    if not preference:
+        users.pop(key, None)
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary = SETTINGS_FILE.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, SETTINGS_FILE)
+
+
+def get_user_search_threshold(user_id: int) -> int:
+    users = _read_settings().get("users", {})
+    preference = users.get(str(user_id), {}) if isinstance(users, dict) else {}
+    value = preference.get("search_threshold", 60) if isinstance(preference, dict) else 60
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 60
+    return max(0, min(100, (value // 5) * 5))
+
+
+def set_user_search_threshold(user_id: int, threshold: int) -> int:
+    value = max(0, min(100, (int(threshold) // 5) * 5))
+    settings = _read_settings()
+    users = settings.setdefault("users", {})
+    preference = users.setdefault(str(user_id), {})
+    if not isinstance(preference, dict):
+        preference = {}
+        users[str(user_id)] = preference
+    preference["search_threshold"] = value
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = SETTINGS_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, SETTINGS_FILE)
+    return value
 
 
 # User-facing Polish phrases are the canonical source strings in the existing bot.
