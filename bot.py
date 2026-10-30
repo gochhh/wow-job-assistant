@@ -4,12 +4,13 @@ import logging
 from logging.handlers import RotatingFileHandler
 import msvcrt
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from agents import Agent, RunConfig, Runner
 from pydantic import BaseModel, ConfigDict, Field
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import Bot, BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
@@ -25,7 +26,7 @@ from bot_language import (
     AUTO_LANGUAGE_LABEL, BOT_COMMAND_DESCRIPTIONS, INFO_TEXT, LANGUAGE_NAMES, LANGUAGE_PROMPT,
     LANGUAGE_SET_TEXT, MENU_ACTIONS, MENU_LABELS, MENU_ROW_LAYOUT, PROFILE_ACTION_LABELS,
     START_TEXT, SUPPORTED_LANGUAGES, language_for_chat, language_for_user, localize_markup,
-    normalize_language, remember_telegram_language, set_user_language, translate_ui_text,
+    commands_for_language, format_ui, normalize_language, remember_telegram_language, set_user_language, translate_ui_text,
 )
 from career_features import (
     assess_application_fields,
@@ -37,16 +38,59 @@ from career_features import (
     list_profiles,
     profile_registry,
     rank_jobs,
+    suggest_related_job_titles,
     save_approved_profile,
-    save_profile_language,
     save_search_results,
     selected_jobs,
-    select_profile_language,
     set_active_profile,
     toggle_selected_job,
-    translate_profile,
     update_active_profile,
 )
+
+def _install_localized_outputs() -> None:
+    """Translate known UI copy at the Telegram output boundary; preserve source data."""
+    if getattr(Message.reply_text, "_wow_localized", False):
+        return
+    original_reply = Message.reply_text
+    original_edit = Message.edit_text
+    original_query_edit = CallbackQuery.edit_message_text
+    original_send = Bot.send_message
+
+    async def reply_text(message, text, *args, **kwargs):
+        user = getattr(message, "from_user", None)
+        if user:
+            remember_telegram_language(user.id, getattr(user, "language_code", None))
+        language = language_for_user(user)
+        kwargs["reply_markup"] = localize_markup(kwargs.get("reply_markup"), language)
+        return await original_reply(message, translate_ui_text(text, language), *args, **kwargs)
+
+    async def edit_text(message, text, *args, **kwargs):
+        user = getattr(message, "from_user", None)
+        if user:
+            remember_telegram_language(user.id, getattr(user, "language_code", None))
+        language = language_for_user(user)
+        kwargs["reply_markup"] = localize_markup(kwargs.get("reply_markup"), language)
+        return await original_edit(message, translate_ui_text(text, language), *args, **kwargs)
+
+    async def query_edit(query, text, *args, **kwargs):
+        user = getattr(query, "from_user", None)
+        if user:
+            remember_telegram_language(user.id, getattr(user, "language_code", None))
+        language = language_for_user(user)
+        kwargs["reply_markup"] = localize_markup(kwargs.get("reply_markup"), language)
+        return await original_query_edit(query, translate_ui_text(text, language), *args, **kwargs)
+
+    async def send_message(bot, chat_id, text, *args, **kwargs):
+        language = language_for_chat(chat_id)
+        kwargs["reply_markup"] = localize_markup(kwargs.get("reply_markup"), language)
+        return await original_send(bot, chat_id, translate_ui_text(text, language), *args, **kwargs)
+
+    reply_text._wow_localized = True
+    Message.reply_text = reply_text
+    Message.edit_text = edit_text
+    CallbackQuery.edit_message_text = query_edit
+    Bot.send_message = send_message
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "cv"
@@ -159,7 +203,7 @@ def main_menu_keyboard(language: str) -> ReplyKeyboardMarkup:
 def profile_menu_keyboard(language: str) -> ReplyKeyboardMarkup:
     labels = PROFILE_ACTION_LABELS.get(language, PROFILE_ACTION_LABELS["en"])
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(labels[key])] for key in ("complete", "manage", "language", "delete", "back_main")],
+        [[KeyboardButton(labels[key])] for key in ("complete", "manage", "delete", "back_main")],
         resize_keyboard=True, is_persistent=True,
     )
 
@@ -170,10 +214,12 @@ def _ui_language_from_message(message) -> str:
 
 
 def _ui_language(update: Update) -> str:
-    language = language_for_user(update.effective_user)
     user = update.effective_user
+    detected = normalize_language(getattr(user, "language_code", None)) if user else "en"
+    language = language_for_user(user)
     if user:
         remember_telegram_language(user.id, getattr(user, "language_code", None))
+    LOGGER.info("UI language resolved: telegram=%s, selected=%s", detected, language)
     return language
 
 
@@ -257,6 +303,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_private_owner(update):
         await message.reply_text(translate_ui_text("Ten bot jest prywatny.", language))
         return
+    await context.bot.set_my_commands([BotCommand(command, description) for command, description in commands_for_language(language)], scope=BotCommandScopeChat(chat_id=update.effective_chat.id))
     text = START_TEXT.get(language, START_TEXT["en"])
     await message.reply_text(text, reply_markup=main_menu_keyboard(language))
 
@@ -266,6 +313,7 @@ async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not message or not is_private_owner(update):
         return
     language = _ui_language(update)
+    await context.bot.set_my_commands([BotCommand(command, description) for command, description in commands_for_language(language)], scope=BotCommandScopeChat(chat_id=update.effective_chat.id))
     await message.reply_text(LANGUAGE_PROMPT[language], reply_markup=_language_keyboard(language))
 
 
@@ -308,8 +356,6 @@ async def menu_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await complete_command(update, context)
         elif profile_action == "manage":
             await cvs_command(update, context)
-        elif profile_action == "language":
-            await profile_language_menu(update, context)
         elif profile_action == "delete":
             await delete_profile_command(update, context)
         elif profile_action == "back_main":
@@ -323,7 +369,7 @@ async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
     if message and user and chat and chat.type == ChatType.PRIVATE:
-        await message.reply_text(f"Twój Telegram ID: {user.id}")
+        await message.reply_text(format_ui("telegram_id", _ui_language_from_message(message), id=user.id))
 
 
 async def receive_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -343,6 +389,7 @@ async def receive_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await message.reply_text("Plik jest za duży. Limit tej wersji to 15 MB.")
         return
 
+    await message.reply_text(translate_ui_text("Odebrałem CV. Pobieram plik z Telegrama i zapisuję go lokalnie…", _ui_language(update)))
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     destination = DATA_DIR / f"cv_{timestamp}{suffix}"
@@ -413,7 +460,9 @@ def extract_text(path: Path) -> str:
         raise ValueError(
             "Nie udało się wyodrębnić tekstu. PDF może być skanem obrazu; OCR nie jest jeszcze obsługiwany."
         )
-    return text[:MAX_EXTRACTED_CHARS]
+    if len(text) > MAX_EXTRACTED_CHARS:
+        raise CvTextLimitError()
+    return text
 
 
 def normalize_source(value: str) -> str:
@@ -556,52 +605,44 @@ async def create_profile(cv_text: str) -> CandidateProfile:
 
 
 
-def _short_list(title: str, values: list[str], max_items: int = 6) -> str:
-    if not values:
-        return f"{title}: —"
-    shown = values[:max_items]
-    suffix = " …" if len(values) > max_items else ""
-    return f"{title}: " + ", ".join(shown) + suffix
+def _display_list(title: str, values: list[str]) -> str:
+    return f"{title}: " + (", ".join(values) if values else "—")
 
 
-def profile_preview(profile: CandidateProfile) -> str:
+def profile_preview(profile: CandidateProfile, language: str = "pl") -> str:
     lines = [
         "ROBOCZY PROFIL DO SPRAWDZENIA",
-        f"Osoba: {profile.full_name or 'brak w CV'}",
-        f"Kontakt: {profile.email or 'brak'} | {profile.phone or 'brak'}",
-        f"Lokalizacja: {profile.location_city_country or 'brak'}",
-        f"Nagłówek: {profile.professional_headline or 'brak'}",
-        f"Doświadczenie: {profile.years_of_experience or 'brak'}",
-        "",
-        (profile.summary or "Brak podsumowania w CV")[:800],
-        "",
-        _short_list("Kompetencje", profile.skills, 12),
-        "",
+        f"Osoba: {profile.full_name or translate_ui_text("brak w CV", language)}",
+        f"Kontakt: {profile.email or translate_ui_text("brak", language)} | {profile.phone or translate_ui_text("brak", language)}",
+        f"Lokalizacja: {profile.location_city_country or translate_ui_text("brak", language)}",
+        f"Nagłówek: {profile.professional_headline or translate_ui_text("brak", language)}",
+        f"Doświadczenie: {profile.years_of_experience or translate_ui_text("brak", language)}",
+        "", profile.summary or translate_ui_text("Brak podsumowania w CV", language), "",
+        _display_list("Kompetencje", profile.skills), "",
         "DOŚWIADCZENIE I CZYNNOŚCI WPROST WSKAZANE W CV",
     ]
     for index, experience in enumerate(profile.work_experience, start=1):
-        title = " — ".join(
-            part for part in (experience.role, experience.employer, experience.period) if part
-        ) or f"Stanowisko {index}"
+        title = " — ".join(part for part in (experience.role, experience.employer, experience.period) if part) or format_ui("candidate_position", language, number=index)
         lines.append(f"{index}. {title}")
-        if experience.activities:
-            lines.extend(f"   • {activity}" for activity in experience.activities)
-            if experience.source_excerpt:
-                lines.append(f"   Fragment źródłowy: {experience.source_excerpt[:600]}")
-        else:
+        lines.extend(f"   • {activity}" for activity in experience.activities)
+        if experience.source_excerpt:
+            lines.append(f"   Fragment źródłowy: {experience.source_excerpt}")
+        if not experience.activities:
             lines.append("   Brak czynności potwierdzonych dosłownym fragmentem CV.")
-
+    lines.extend(["", "EDUKACJA"])
+    for index, item in enumerate(profile.education, start=1):
+        lines.append(f"{index}. {' — '.join(part for part in (item.degree, item.institution, item.period) if part) or '—'}")
     lines.extend([
-        "",
-        _short_list("Branże", profile.industries),
-        _short_list("Języki", profile.languages),
-        _short_list("Certyfikaty", profile.certifications),
-        _short_list("Preferencje", profile.work_preferences),
-        _short_list("Do potwierdzenia", profile.questions_for_candidate, 8),
-        "",
-        "Sprawdź dane. Zapis nastąpi dopiero po wybraniu „Zatwierdź i zapisz”.",
+        "", _display_list("Branże", profile.industries),
+        _display_list("Języki", profile.languages),
+        _display_list("Certyfikaty", profile.certifications),
+        _display_list("Najważniejsze projekty", profile.project_highlights),
+        _display_list("Preferencje", profile.work_preferences),
+        _display_list("Informacje uzupełnione przez Ciebie", profile.supplemental_information),
+        _display_list("Do potwierdzenia", profile.questions_for_candidate),
+        "", "Sprawdź dane. Zapis nastąpi dopiero po wybraniu „Zatwierdź i zapisz”.",
     ])
-    return "\n".join(lines)[:3900]
+    return "\n".join(lines)
 
 
 def _active_profile() -> tuple[str, dict[str, object], CandidateProfile] | None:
@@ -624,7 +665,6 @@ async def _send_split(message, text: str, reply_markup=None) -> None:
 def _profile_actions() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Uzupełnij profil", callback_data="profile:add"), InlineKeyboardButton("Usuń aktywny profil", callback_data="profile:delete_confirm")],
-        [InlineKeyboardButton("PL", callback_data="profile:language:pl"), InlineKeyboardButton("EN", callback_data="profile:language:en"), InlineKeyboardButton("RU", callback_data="profile:language:ru"), InlineKeyboardButton("UK", callback_data="profile:language:uk")],
     ])
 
 
@@ -648,7 +688,13 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     profile_id, profile_record = active
     original = profile_record.get("languages", {}).get("original", profile_record.get("profile", {}))
     profile = CandidateProfile.model_validate(original)
-    await _send_split(message, profile_preview(profile), profile_menu_keyboard(language))
+    await _send_split(message, profile_preview(profile, language), profile_menu_keyboard(language))
+
+
+def list_local_cv_files() -> list[Path]:
+    if not DATA_DIR.is_dir():
+        return []
+    return sorted((path for path in DATA_DIR.iterdir() if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS), key=lambda path: path.stat().st_mtime, reverse=True)
 
 
 async def cvs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -658,18 +704,44 @@ async def cvs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await message.reply_text("Ten bot jest prywatny.")
         return
     profiles = list_profiles()
-    if not profiles:
-        await message.reply_text("Nie ma jeszcze zapisanego profilu. Wyślij CV i zatwierdź jego analizę.")
-        return
     active_id = profile_registry().get("active_profile_id")
+    files = list_local_cv_files()
     rows = []
-    for profile_id, record in profiles:
-        languages = ", ".join(record.get("languages", {}).keys()) or "original"
-        name = record.get("source_cv") or profile_id
-        marker = "★ " if profile_id == active_id else ""
-        rows.append([InlineKeyboardButton(f"{marker}{name} ({languages})"[:60], callback_data=f"cv:active:{profile_id}")])
-    rows.append([InlineKeyboardButton("Usuń aktywny profil", callback_data="profile:delete_confirm")])
-    await message.reply_text("Zapisane profile. Wybierz CV, którego profil ma być aktywny:", reply_markup=InlineKeyboardMarkup(rows))
+    if profiles:
+        rows.append([InlineKeyboardButton("Profile zapisane z CV:", callback_data="noop")])
+        for profile_id, record in profiles:
+            name = record.get("source_cv") or profile_id
+            marker = "★ " if profile_id == active_id else ""
+            rows.append([InlineKeyboardButton(f"{marker}{name}"[:60], callback_data=f"cv:active:{profile_id}")])
+    if files:
+        rows.append([InlineKeyboardButton("Lokalne pliki CV — wybierz, aby usunąć:", callback_data="noop")])
+        language = _ui_language(update)
+        for path in files:
+            rows.append([InlineKeyboardButton(format_ui("analyze_cv_button", language, filename=path.name)[:60], callback_data=f"cv:analyze:{path.name}")])
+            rows.append([InlineKeyboardButton(f"🗑️ {path.name}"[:60], callback_data=f"cv:delete_confirm:{path.name}")])
+    if not files and not profiles:
+        await message.reply_text("Nie ma zapisanych CV ani profili. Wyślij CV w tym czacie, aby je dodać.", reply_markup=profile_menu_keyboard(_ui_language(update)))
+        return
+    if profiles or files:
+        rows.append([InlineKeyboardButton("🔙 Wróć do profilu", callback_data="profile:back")])
+        await message.reply_text("Zarządzanie profilami i zapisanymi CV:", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def confirm_delete_cv(message, filename: str) -> None:
+    path = validate_cv_path(str(DATA_DIR / filename))
+    if not path:
+        await message.reply_text("Nie znaleziono tego lokalnego CV.")
+        return
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Usuń wybrane CV", callback_data=f"cv:delete:{path.name}"),
+        InlineKeyboardButton("Anuluj", callback_data="cv:delete_cancel"),
+    ]])
+    linked = any(str(record.get("source_cv") or "") == path.name for _, record in list_profiles())
+    language = _ui_language_from_message(message)
+    text = format_ui("delete_cv_confirm", language, filename=path.name)
+    if linked:
+        text += " " + translate_ui_text("Profil powiązany pozostanie zapisany, ale nie będzie można ponownie odczytać jego źródłowego CV.", language)
+    await message.reply_text(text, reply_markup=keyboard)
 
 
 async def use_cv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -679,7 +751,7 @@ async def use_cv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await message.reply_text("Ten bot jest prywatny.")
         return
     if context.args and set_active_profile(context.args[0]):
-        await message.reply_text(f"Aktywny profil zmieniono na {context.args[0]}.")
+        await message.reply_text(format_ui("active_profile_changed", _ui_language(update), id=context.args[0]))
         return
     await cvs_command(update, context)
 
@@ -713,73 +785,31 @@ async def delete_profile_command(update: Update, context: ContextTypes.DEFAULT_T
     if not active:
         await message.reply_text("Nie ma aktywnego profilu do usunięcia.")
         return
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Usuń profil", callback_data="profile:delete"),
-        InlineKeyboardButton("Anuluj", callback_data="profile:delete_cancel"),
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Usuń profil", callback_data="profile:delete")],
+        [InlineKeyboardButton("Anuluj", callback_data="profile:delete_cancel")],
+    ])
     await message.reply_text("Usunę zapisany profil kandydata. Oryginalny plik CV pozostanie lokalnie i będzie można ponownie go przeanalizować. Potwierdzasz?", reply_markup=keyboard)
 
 
-async def profile_language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message or not is_private_owner(update):
-        return
-    language = _ui_language(update)
-    buttons = [[InlineKeyboardButton(LANGUAGE_NAMES[code], callback_data=f"profile:language:{code}")] for code in ("pl", "en", "ru", "uk")]
-    await message.reply_text(translate_ui_text("Wybierz język profilu:", language), reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message or not is_private_owner(update):
-        if message:
-            await message.reply_text("Ten bot jest prywatny.")
-        return
-    if not context.args:
-        await message.reply_text("Użyj /translate en, /translate ru, /translate uk lub /translate pl.")
-        return
-    language = context.args[0].lower()
-    if language not in {"pl", "en", "ru", "uk"}:
-        await message.reply_text("Obsługiwane języki: pl, en, ru, uk.")
-        return
-    active = _active_profile()
-    if not active:
-        await message.reply_text("Najpierw zapisz profil poleceniem /analyze.")
-        return
-    profile_id, record, profile = active
-    if language in record.get("languages", {}):
-        select_profile_language(profile_id, language)
-        await message.reply_text(f"Aktywny język profilu: {language}.")
-        return
-    await message.reply_text(f"Tłumaczę profil na język {language}…")
-    try:
-        translated = await translate_profile(profile.model_dump(mode="json"), language)
-        save_profile_language(profile_id, language, translated)
-        await message.reply_text(f"Profil przetłumaczony i zapisany lokalnie. Aktywny język: {language}. Użyj /profile, aby go sprawdzić.")
-    except Exception as exc:
-        LOGGER.error("Tłumaczenie profilu nie powiodło się (%s).", type(exc).__name__)
-        await message.reply_text("Nie udało się przetłumaczyć profilu. Oryginalna wersja pozostała bez zmian.")
-
-
 async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int) -> None:
-    if not ranked:
-        await message.reply_text("Nie udało się znaleźć ofert na tej stronie albo Pracuj.pl zablokował automatyczny odczyt. Spróbuj innego zapytania później.")
-        return
-    chosen = selected_jobs().get("jobs", {})
     page_size = 8
     start = (page - 1) * page_size
     visible = ranked[start:start + page_size]
+    if not ranked:
+        await message.reply_text("Nie znaleziono ofert spełniających próg dopasowania 60% albo portal zablokował odczyt. Spróbuj później lub zmień kryteria.")
+        return
     if not visible:
         await message.reply_text("Nie ma już ofert na tej stronie wyników.")
         return
+    chosen = selected_jobs().get("jobs", {})
     for row in visible:
-        offer = row["offer"]
-        fit = row["fit"]
+        offer, fit = row["offer"], row["fit"]
         if not isinstance(offer, dict) or not isinstance(fit, dict):
             continue
-        matching = ", ".join(fit.get("matching_requirements", [])[:5]) or "brak potwierdzonych dopasowań"
-        gaps = ", ".join(fit.get("gaps", [])[:5]) or "brak wskazanych luk"
-        title = offer.get("title", "Oferta")
+        matching = ", ".join(fit.get("matching_requirements", [])) or "brak potwierdzonych dopasowań"
+        gaps = ", ".join(fit.get("gaps", [])) or "brak wskazanych luk"
+        title = str(offer.get("title") or "Oferta")
         text = (
             f"{fit.get('color', '⚪')} Dopasowanie: {fit.get('score', 0)}%\n"
             f"{title}\n{offer.get('company') or 'Firma niepodana'} | {offer.get('location') or 'Lokalizacja niepodana'}\n"
@@ -788,12 +818,39 @@ async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int)
         action = "job:remove:" if offer.get("id") in chosen else "job:add:"
         label = "Usuń z wybranych" if offer.get("id") in chosen else "Wybieram tę ofertę"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=action + str(offer.get("id", "")))]] )
-        await message.reply_text(text[:3900], reply_markup=keyboard)
+        await _send_split(message, text, keyboard)
     if start + page_size < len(ranked):
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Następne oferty", callback_data=f"job:page:{page + 1}")]])
-        await message.reply_text(f"Pokazano {start + 1}–{start + len(visible)} z {len(ranked)} ofert z tej strony Pracuj.pl. Użyj przycisku, aby zobaczyć dalsze wyniki.", reply_markup=keyboard)
+        await message.reply_text(format_ui("search_results_more", _ui_language_from_message(message), start=start + 1, end=start + len(visible), total=len(ranked)), reply_markup=keyboard)
     else:
-        await message.reply_text(f"Pokazano {start + 1}–{start + len(visible)} z {len(ranked)} ofert pobranych ze strony Pracuj.pl. Kolejne wyniki możesz otworzyć poleceniem /jobs.")
+        await message.reply_text(format_ui("search_results_end", _ui_language_from_message(message), start=start + 1, end=start + len(visible), total=len(ranked)))
+
+
+def _job_search_terms(profile: CandidateProfile, primary_query: str, related_titles: list[str] | None = None) -> list[str]:
+    terms: list[str] = []
+    def add(value: str | None) -> None:
+        value = " ".join((value or "").split()).strip(" ,;|/")
+        if value and value.casefold() not in {item.casefold() for item in terms}:
+            terms.append(value)
+    add(primary_query)
+    add(profile.professional_headline)
+    for experience in profile.work_experience:
+        add(experience.role)
+    for title in related_titles or []:
+        add(title)
+    synonyms = (
+        (("project manager", "kierownik projektu", "menedżer projektu", "manager projektu"), ("Project Manager", "Kierownik projektu", "Menedżer projektu")),
+        (("business analyst", "analityk biznesowy", "analyst biznesowy"), ("Business Analyst", "Analityk biznesowy")),
+        (("product manager", "kierownik produktu", "menedżer produktu"), ("Product Manager", "Kierownik produktu")),
+        (("scrum master", "agile coach"), ("Scrum Master", "Agile Coach")),
+        (("software engineer", "software developer", "programista", "inżynier oprogramowania"), ("Software Developer", "Programista", "Software Engineer")),
+    )
+    originals = " ".join(terms).casefold()
+    for triggers, alternatives in synonyms:
+        if any(trigger in originals for trigger in triggers):
+            for term in alternatives:
+                add(term)
+    return terms
 
 
 async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: str, location: str | None, page: int = 1) -> None:
@@ -801,29 +858,65 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
     if not active:
         await message.reply_text("Najpierw zapisz aktywny profil poleceniem /analyze.")
         return
-    _, _, profile = active
-    status = await message.reply_text(translate_ui_text("Pobieram oferty z Pracuj.pl.", _ui_language_from_message(message)))
+    profile = active[2]
+    status = await message.reply_text("Rozpoczynam wyszukiwanie ofert na Pracuj.pl. Sprawdzę kolejne strony i zbliżone nazwy stanowisk.")
+    search_started = time.monotonic()
+    terms = _job_search_terms(profile, query)
     try:
-        offers = await asyncio.to_thread(fetch_pracuj_jobs, query, location, page)
-        await status.edit_text(translate_ui_text("Oceniam dopasowanie ", _ui_language_from_message(message)) + str(len(offers)) + "…")
-        ranked = await rank_jobs(profile.model_dump(mode="json"), offers[:30])
-        ranked = [row for row in ranked if int(row.get("fit", {}).get("score", 0)) >= 45]
+        await status.edit_text(translate_ui_text("Analizuję udokumentowane obowiązki i kompetencje, aby dobrać zbliżone nazwy stanowisk…", _ui_language_from_message(message)))
+        related_titles = await suggest_related_job_titles(profile.model_dump(mode="json"), _ui_language_from_message(message))
+        terms = _job_search_terms(profile, query, related_titles)
     except Exception as exc:
-        detail = str(exc)
-        if isinstance(exc, RuntimeError) and detail.startswith("Pracuj.pl zwrócił kod HTTP "):
-            safe_detail = detail.rstrip(".")
-        elif isinstance(exc, RuntimeError) and detail.startswith("Nie udało się połączyć z Pracuj.pl."):
-            safe_detail = "błąd połączenia z Pracuj.pl"
-        else:
-            safe_detail = "szczegóły pominięto"
-        LOGGER.error("Wyszukiwanie ofert nie powiodło się (%s): %s.", type(exc).__name__, safe_detail)
-        await status.edit_text(translate_ui_text("Nie udało się pobrać lub ocenić ofert. Sprawdź połączenie i spróbuj ponownie.", _ui_language_from_message(message)))
+        LOGGER.error("Rozszerzenie nazw stanowisk nie powiodło się (%s); używam nazw z profilu.", type(exc).__name__)
+    offers_by_id: dict[str, object] = {}
+    pages_scanned = 0
+    try:
+        for term_index, term in enumerate(terms, start=1):
+            seen_page_ids: set[frozenset[str]] = set()
+            portal_page = 0
+            while True:
+                portal_page += 1
+                try:
+                    page_offers = await asyncio.to_thread(fetch_pracuj_jobs, term, location, portal_page)
+                except RuntimeError as exc:
+                    if portal_page > 1 and "HTTP 404" in str(exc):
+                        break
+                    raise
+                pages_scanned += 1
+                current_ids = {str(item.id) for item in page_offers}
+                page_key = frozenset(current_ids)
+                if not page_offers or page_key in seen_page_ids:
+                    break
+                seen_page_ids.add(page_key)
+                for offer in page_offers:
+                    offers_by_id.setdefault(str(offer.id), offer)
+                if portal_page == 1 or portal_page % 3 == 0:
+                    await status.edit_text(format_ui("search_page_progress", _ui_language_from_message(message), pages=pages_scanned, count=len(offers_by_id)))
+
+        offers = list(offers_by_id.values())
+        if not offers:
+            save_search_results([])
+            await status.edit_text("Nie udało się pobrać ofert z Pracuj.pl. Portal może blokować automatyczny odczyt albo nie ma wyników dla tych stanowisk.")
+            return
+        all_ranked: list[dict[str, object]] = []
+        batches = [offers[i:i + 5] for i in range(0, len(offers), 5)]
+        for batch_index, batch in enumerate(batches, start=1):
+            await status.edit_text(format_ui("search_batch", _ui_language_from_message(message), count=len(offers), pages=pages_scanned, index=batch_index, total=len(batches)))
+            all_ranked.extend(await rank_jobs(profile.model_dump(mode="json"), batch, _ui_language_from_message(message)))
+        all_ranked = [row for row in all_ranked if int(row.get("fit", {}).get("score", 0)) >= 60]
+        all_ranked.sort(key=lambda row: int(row.get("fit", {}).get("score", 0)), reverse=True)
+    except Exception as exc:
+        LOGGER.error("Wyszukiwanie ofert nie powiodło się (%s).", type(exc).__name__)
+        await status.edit_text("Nie udało się pobrać lub ocenić ofert. Sprawdź połączenie i spróbuj ponownie.")
         return
     context.user_data["job_query"] = query
     context.user_data["job_location"] = location
-    context.user_data["job_page"] = page
-    save_search_results(ranked)
-    await _send_ranked_jobs(message, ranked, 1)
+    context.user_data["job_page"] = 1
+    save_search_results(all_ranked)
+    elapsed = time.monotonic() - search_started
+    LOGGER.info("Pracuj search completed: terms=%d pages=%d offers=%d qualified=%d elapsed_seconds=%.2f", len(terms), pages_scanned, len(offers), len(all_ranked), elapsed)
+    await status.edit_text(format_ui("search_finished", _ui_language_from_message(message), pages=pages_scanned, count=len(offers), qualified=len(all_ranked), seconds=elapsed))
+    await _send_ranked_jobs(message, all_ranked, 1)
 
 
 async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -837,7 +930,7 @@ async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("Najpierw zapisz aktywny profil poleceniem /analyze.")
         return
     profile = active[2]
-    query_text = " ".join(context.args).strip()
+    query_text = " ".join(context.args or []).strip()
     location = None
     if query_text:
         if "|" in query_text:
@@ -846,7 +939,7 @@ async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             query_text, location = (part.strip() or None for part in query_text.split(",", 1))
     else:
         query_text = profile.professional_headline or next((item.role for item in profile.work_experience if item.role), "") or ""
-        location = profile.location_city_country
+        location = None
     if not query_text:
         await message.reply_text("Podaj stanowisko lub słowa kluczowe: /jobs Kierownik projektu | Wrocław")
         return
@@ -880,16 +973,53 @@ async def apply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await message.reply_text("Ten bot jest prywatny.")
         return
     jobs = selected_jobs().get("jobs", {})
-    if not context.args:
-        await message.reply_text("Najpierw wybierz ofertę w wynikach /jobs, a potem użyj /apply ID_OFERTY. Wybrane pozycje zobaczysz przez /selected.")
+    active = _active_profile()
+    if not active:
+        await message.reply_text("Najpierw zapisz aktywny profil poleceniem /analyze.")
         return
-    job_id = context.args[0]
-    if job_id not in jobs:
-        await message.reply_text("Ta oferta nie jest na liście wybranych. Użyj /selected i skopiuj jej ID.")
+    if not jobs:
+        await message.reply_text("Nie wybrano ofert. Najpierw wybierz pasujące oferty w wynikach wyszukiwania.")
         return
-    context.user_data["flow"] = "application_fields"
-    context.user_data["application_job_id"] = job_id
-    await message.reply_text("Otwórz formularz Pracuj.pl i wklej tutaj nazwy/pytania z jego pól, po jednym w wierszu. Sprawdzę, które dane są w profilu, przygotuję odpowiedzi i oznaczę braki. Bot nie wypełnia ani nie wysyła formularza za Ciebie. Anuluj poleceniem /cancel.")
+    requested = context.args[0] if context.args else None
+    if requested and requested not in jobs:
+        await message.reply_text("Ta oferta nie jest na liście wybranych. Użyj /selected, aby sprawdzić wybór.")
+        return
+    selected = [(job_id, item) for job_id, item in jobs.items() if not requested or job_id == requested]
+    language = _ui_language(update)
+    for job_id, saved in selected:
+        offer = saved.get("offer", {})
+        title = str(offer.get("title") or "Oferta")
+        url = str(offer.get("url") or "")
+        status_message = await message.reply_text(translate_ui_text("Sprawdzam publiczny formularz wybranej oferty…", language))
+        fields, scan_status = await asyncio.to_thread(inspect_pracuj_application_form, url)
+        if scan_status != "ok" or not fields:
+            reason = {
+                "external": "Oferta prowadzi do zewnętrznego systemu rekrutacyjnego.",
+                "login_or_unavailable": "Formularz wymaga logowania albo portal odmówił dostępu.",
+                "dynamic_or_login": "Formularz jest ładowany dynamicznie albo wymaga logowania.",
+                "too_large": "Strona formularza przekracza limit odczytu.",
+            }.get(scan_status, "Nie udało się odczytać publicznego formularza.")
+            await status_message.edit_text(translate_ui_text(reason + " Bot nie poprosi Cię o ręczne wklejanie pytań; otwórz formularz samodzielnie:", language) + "\n" + url)
+            continue
+        await status_message.edit_text(translate_ui_text("Odczytałem pola formularza. Przygotowuję odpowiedzi na podstawie profilu…", language))
+        try:
+            assessments = await assess_application_fields(active[2].model_dump(mode="json"), offer, fields)
+        except Exception as exc:
+            LOGGER.error("Analiza formularza nie powiodła się (%s).", type(exc).__name__)
+            await message.reply_text(translate_ui_text("Pola odczytano, ale przygotowanie odpowiedzi nie powiodło się. Spróbuj ponownie później.", language) + "\n" + url)
+            continue
+        company = str(offer.get("company") or translate_ui_text("Firma niepodana", language))
+        lines = [translate_ui_text("Odpowiedzi do skopiowania", language) + ": " + title, translate_ui_text("Pracodawca: ", language) + company, url, ""]
+        for index, item in enumerate(assessments, start=1):
+            lines.append(f"{index}. {item.get('field', 'Pole')}")
+            if item.get("profile_data_available") and item.get("suggested_answer"):
+                lines.append(translate_ui_text("Odpowiedź do skopiowania: ", language) + str(item["suggested_answer"]))
+            else:
+                lines.append(translate_ui_text("Brak danych: ", language) + str(item.get("missing_information") or translate_ui_text("Uzupełnij tę informację ręcznie.", language)))
+            lines.append("")
+        lines.append(translate_ui_text("Sprawdź propozycje, skopiuj odpowiedzi i samodzielnie wyślij aplikację. Bot nie loguje się ani nie wysyła formularza.", language))
+        await status_message.edit_text(translate_ui_text("Pola formularza sprawdzone dla wybranej oferty:", language) + " " + title)
+        await _send_split(message, "\n".join(lines))
 
 
 async def free_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -908,41 +1038,15 @@ async def free_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if not value:
             await message.reply_text("Wyślij tekstowe informacje do dopisania albo /cancel.")
             return
-        profile.supplemental_information.append(value)
-        update_active_profile(profile_id, profile.model_dump(mode="json"))
+        updated = profile.model_copy(deep=True)
+        updated.supplemental_information.append(value)
         context.user_data.pop("flow", None)
-        await message.reply_text("Dopisano i zapisano informacje lokalnie. Tłumaczenia profilu wymagają odświeżenia; użyj /translate en, /translate ru lub /translate uk.")
-        return
-    if flow == "application_fields":
-        active = _active_profile()
-        job_id = context.user_data.get("application_job_id")
-        saved = selected_jobs().get("jobs", {}).get(job_id)
-        if not active or not saved:
-            context.user_data.pop("flow", None)
-            await message.reply_text("Nie znaleziono aktywnego profilu lub wybranej oferty. Zacznij ponownie przez /selected.")
-            return
-        fields = [line.strip(" •-\\t") for line in (message.text or "").splitlines() if line.strip(" •-\\t")]
-        if not fields:
-            await message.reply_text("Nie widzę nazw pól. Wklej pytania z formularza, po jednym w wierszu, albo /cancel.")
-            return
-        await message.reply_text("Porównuję pola formularza z aktywnym profilem…")
-        try:
-            assessments = await assess_application_fields(active[2].model_dump(mode="json"), saved["offer"], fields)
-        except Exception as exc:
-            LOGGER.error("Analiza formularza nie powiodła się (%s).", type(exc).__name__)
-            await message.reply_text("Nie udało się przeanalizować pól. Spróbuj ponownie.")
-            return
-        lines = [f"Odpowiedzi dla oferty: {saved['offer'].get('title', 'Oferta')}", ""]
-        for index, item in enumerate(assessments, start=1):
-            lines.append(f"{index}. {item.get('field', 'Pole')}")
-            if item.get("profile_data_available") and item.get("suggested_answer"):
-                lines.append(f"   Odpowiedź do skopiowania: {item['suggested_answer']}")
-            else:
-                lines.append(f"   Brak danych: {item.get('missing_information') or 'uzupełnij tę informację ręcznie'}")
-            lines.append("")
-        lines.append("Teksty są roboczymi propozycjami opartymi na profilu. Sprawdź je, skopiuj i samodzielnie wyślij aplikację w Pracuj.pl.")
-        context.user_data.pop("flow", None)
-        await _send_split(message, chr(10).join(lines))
+        context.user_data["profile_supplement_draft"] = {"profile_id": profile_id, "profile": updated.model_dump(mode="json")}
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Zapisz uzupełnienie", callback_data="profile_supplement:approve"),
+            InlineKeyboardButton("Anuluj", callback_data="profile_supplement:cancel"),
+        ]])
+        await _send_split(message, profile_preview(updated, _ui_language_from_message(message)), keyboard)
         return
     await message.reply_text("Nie rozpoznałem oczekiwanej odpowiedzi. Użyj /start, aby zobaczyć dostępne polecenia.")
 
@@ -962,7 +1066,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith("cv:active:"):
         profile_id = data.split(":", 2)[2]
         if set_active_profile(profile_id):
-            await query.edit_message_text(f"Aktywny profil zmieniono na {profile_id}. Użyj /profile, aby go wyświetlić.")
+            await query.edit_message_text(format_ui("active_profile_changed", _ui_language(update), id=profile_id))
         else:
             await query.edit_message_text("Nie znaleziono tego profilu.")
         return
@@ -970,11 +1074,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["flow"] = "profile_supplement"
         await query.message.reply_text("Napisz dodatkowe informacje, których brakuje w profilu. Zapiszę je lokalnie. /cancel anuluje.")
         return
+    if data == "profile_supplement:cancel":
+        context.user_data.pop("profile_supplement_draft", None)
+        await query.edit_message_text("Anulowano. Zapisany profil nie został zmieniony.")
+        return
+    if data == "profile_supplement:approve":
+        draft = context.user_data.pop("profile_supplement_draft", None)
+        if not draft or not update_active_profile(draft["profile_id"], draft["profile"]):
+            await query.edit_message_text("Nie udało się zapisać uzupełnienia. Profil mógł zostać usunięty.")
+            return
+        await query.edit_message_text("Uzupełniony profil zapisano lokalnie w języku oryginalnego CV.")
+        return
     if data == "profile:delete_confirm":
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("Usuń profil", callback_data="profile:delete"),
-            InlineKeyboardButton("Anuluj", callback_data="profile:delete_cancel"),
-        ]])
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Usuń profil", callback_data="profile:delete")],
+            [InlineKeyboardButton("Anuluj", callback_data="profile:delete_cancel")],
+        ])
         await query.message.reply_text("Oryginalny plik CV pozostanie lokalnie. Usunąć zapisany profil?", reply_markup=keyboard)
         return
     if data == "profile:delete_cancel":
@@ -986,26 +1101,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text("Nie ma aktywnego profilu.")
             return
         replacement = delete_profile_record(active[0])
-        await query.edit_message_text("Usunięto profil. Plik CV pozostał lokalnie." + (f" Aktywny jest teraz profil {replacement}." if replacement else " Wyślij nowe CV, aby utworzyć kolejny profil."))
+        key = "deleted_profile_with_replacement" if replacement else "deleted_profile_no_replacement"
+        await query.edit_message_text(format_ui(key, _ui_language(update), id=replacement or ""))
         return
-    if data.startswith("profile:language:"):
-        language = data.rsplit(":", 1)[1]
-        active = _active_profile()
-        if not active or language not in {"pl", "en", "ru", "uk"}:
-            await query.edit_message_text("Nie można zmienić języka profilu.")
+    if data == "noop":
+        return
+    if data == "profile:back":
+        await query.message.reply_text("Otwieram profil użytkownika.", reply_markup=profile_menu_keyboard(_ui_language(update)))
+        return
+    if data.startswith("cv:analyze:"):
+        path = validate_cv_path(str(DATA_DIR / data.split(":", 2)[2]))
+        if not path:
+            await query.message.reply_text("Nie znaleziono tego lokalnego CV.")
             return
-        profile_id, record, profile = active
-        if language not in record.get("languages", {}):
-            await query.edit_message_text(f"Tłumaczę profil na {LANGUAGE_NAMES.get(language, language)}…")
-            try:
-                localized = await translate_profile(profile.model_dump(mode="json"), language)
-                save_profile_language(profile_id, language, localized)
-            except Exception as exc:
-                LOGGER.error("Tłumaczenie profilu nie powiodło się (%s).", type(exc).__name__)
-                await query.message.reply_text("Nie udało się przetłumaczyć profilu. Oryginalna wersja pozostała bez zmian.")
-                return
-        select_profile_language(profile_id, language)
-        await query.edit_message_text(f"Wybrano wersję {language} profilu. Wszystkie wersje należą do jednego profilu.")
+        language = _ui_language(update)
+        keyboard = ask_for_cv_consent(path, context)
+        await query.message.reply_text(translate_ui_text("Aby przygotować profil, wyodrębnię tekst z wybranego lokalnego CV i przekażę go do OpenAI API. Profil pokażę Ci do sprawdzenia, a zapiszę dopiero po zatwierdzeniu. Czy wyrażasz zgodę na wysłanie tekstu tego CV do OpenAI?", language), reply_markup=keyboard)
+        return
+    if data.startswith("cv:delete_confirm:"):
+        await confirm_delete_cv(query.message, data.split(":", 2)[2])
+        return
+    if data == "cv:delete_cancel":
+        await query.edit_message_text("Anulowano usuwanie CV. Plik pozostał zapisany.")
+        return
+    if data.startswith("cv:delete:"):
+        path = validate_cv_path(str(DATA_DIR / data.split(":", 2)[2]))
+        if not path:
+            await query.edit_message_text("Nie znaleziono tego lokalnego CV.")
+            return
+        filename = path.name
+        linked = any(str(record.get("source_cv") or "") == filename for _, record in list_profiles())
+        try:
+            path.unlink()
+        except OSError:
+            await query.edit_message_text("Nie udało się usunąć pliku CV. Sprawdź uprawnienia do folderu data/cv.")
+            return
+        await query.edit_message_text(format_ui("deleted_cv_linked" if linked else "deleted_cv_plain", _ui_language(update), filename=filename))
+        await cvs_command(update, context)
         return
     if data.startswith("job:add:") or data.startswith("job:remove:"):
         _, action, job_id = data.split(":", 2)
@@ -1023,11 +1155,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if data.startswith("job:page:"):
         page = int(data.rsplit(":", 1)[1])
-        query_text = context.user_data.get("job_query")
-        if not query_text:
-            await query.message.reply_text("Wyszukiwanie wygasło. Uruchom /jobs ponownie.")
-            return
-        await _run_job_search(query.message, context, query_text, context.user_data.get("job_location"), page)
+        ranked = get_search_results()
+        await _send_ranked_jobs(query.message, ranked, page)
         return
 
 
@@ -1047,6 +1176,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text = LANGUAGE_SET_TEXT[language].format(name=LANGUAGE_NAMES[language])
         else:
             return
+        await context.bot.set_my_commands([BotCommand(command, description) for command, description in commands_for_language(language)], scope=BotCommandScopeChat(chat_id=update.effective_chat.id))
         await query.edit_message_text(text, reply_markup=None)
         await query.message.reply_text(START_TEXT[language], reply_markup=main_menu_keyboard(language))
         return
@@ -1075,6 +1205,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             cv_text = await asyncio.to_thread(extract_text, path)
             profile = await create_profile(cv_text)
+        except CvTextLimitError:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=format_ui("cv_text_limit", _ui_language(update), limit=f"{MAX_EXTRACTED_CHARS:,}"))
+            return
         except Exception as exc:
             LOGGER.error("Analiza CV nie powiodła się (%s).", type(exc).__name__)
             await context.bot.send_message(
@@ -1095,11 +1228,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 InlineKeyboardButton("Odrzuć", callback_data="profile_review:reject"),
             ]]
         )
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=profile_preview(profile),
-            reply_markup=keyboard,
-        )
+        preview_parts = split_telegram_text(profile_preview(profile, _ui_language(update)))
+        for index, part in enumerate(preview_parts):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=part,
+                reply_markup=keyboard if index == len(preview_parts) - 1 else None,
+            )
         return
 
     if query.data == "profile_review:reject":
@@ -1126,17 +1261,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def post_init(application: Application) -> None:
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start", "Instrukcje i stan bota"),
-            BotCommand("id", "Pokaż swój identyfikator Telegram"),
-            BotCommand("analyze", "Przygotuj profil z zapisanego CV"),
-            BotCommand("jobs", "Szukaj dopasowanych ofert"),
-            BotCommand("profile", "Pokaż profil i zarządzaj CV"),
-            BotCommand("language", "Zmień język interfejsu"),
-            BotCommand("cancel", "Anuluj oczekującą operację"),
-        ]
-    )
+    await application.bot.set_my_commands([BotCommand(command, description) for command, description in commands_for_language("en")])
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1149,7 +1274,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+
+async def report_unhandled_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+    LOGGER.error("Nieobsłużony błąd aktualizacji (%s).", type(error).__name__ if error else "unknown")
+    user = getattr(update, "effective_user", None)
+    if user:
+        try:
+            language = language_for_user(user)
+            chat = getattr(update, "effective_chat", None)
+            if chat:
+                await context.bot.send_message(chat_id=chat.id, text=translate_ui_text("Nie udało się dokończyć tej operacji. Bot odebrał polecenie, ale wystąpił błąd; spróbuj ponownie.", language))
+        except Exception:
+            LOGGER.error("Nie udało się wysłać komunikatu o błędzie użytkownikowi.")
+
+
 def main() -> None:
+    _install_localized_outputs()
     load_env_file()
     acquire_instance_lock()
     configure_logging()
@@ -1168,8 +1309,6 @@ def main() -> None:
     application.add_handler(CommandHandler("usecv", use_cv_command))
     application.add_handler(CommandHandler("complete", complete_command))
     application.add_handler(CommandHandler("deleteprofile", delete_profile_command))
-    application.add_handler(CommandHandler("translate", translate_command))
-    application.add_handler(CommandHandler("profilelanguage", profile_language_menu))
     application.add_handler(CommandHandler("jobs", jobs_command))
     application.add_handler(CommandHandler("selected", selected_command))
     application.add_handler(CommandHandler("apply", apply_command))
@@ -1178,6 +1317,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.Document.ALL, receive_cv))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_action_message))
+    application.add_error_handler(report_unhandled_error)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     LOGGER.info("Uruchamiam polling bota Telegram.")
