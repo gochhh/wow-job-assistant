@@ -6,6 +6,7 @@ import msvcrt
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,10 +32,12 @@ from bot_language import (
     commands_for_language, format_ui, normalize_language, remember_telegram_language, set_user_language, translate_ui_text,
 )
 from career_features import (
+    JobOffer,
     assess_application_fields,
     build_search_url,
     delete_profile_record,
     fetch_pracuj_jobs,
+    enrich_pracuj_offer,
     get_profile_record,
     get_search_results,
     list_profiles,
@@ -49,6 +52,10 @@ from career_features import (
     update_active_profile,
 )
 
+_last_pracuj_detail_request_at = 0.0
+_ACTIVE_JOB_SEARCHES: dict[int, asyncio.Task] = {}
+_ACTIVE_JOB_SEARCH_STATUSES: dict[int, Message] = {}
+
 def _install_localized_outputs() -> None:
     """Translate known UI copy at the Telegram output boundary; preserve source data."""
     if getattr(Message.reply_text, "_wow_localized", False):
@@ -59,18 +66,12 @@ def _install_localized_outputs() -> None:
     original_send = Bot.send_message
 
     async def reply_text(message, text, *args, **kwargs):
-        user = getattr(message, "from_user", None)
-        if user:
-            remember_telegram_language(user.id, getattr(user, "language_code", None))
-        language = language_for_user(user)
+        language = _ui_language_from_message(message)
         kwargs["reply_markup"] = localize_markup(kwargs.get("reply_markup"), language)
         return await original_reply(message, translate_ui_text(text, language), *args, **kwargs)
 
     async def edit_text(message, text, *args, **kwargs):
-        user = getattr(message, "from_user", None)
-        if user:
-            remember_telegram_language(user.id, getattr(user, "language_code", None))
-        language = language_for_user(user)
+        language = _ui_language_from_message(message)
         kwargs["reply_markup"] = localize_markup(kwargs.get("reply_markup"), language)
         return await original_edit(message, translate_ui_text(text, language), *args, **kwargs)
 
@@ -216,7 +217,10 @@ def profile_menu_keyboard(language: str) -> ReplyKeyboardMarkup:
 
 def _ui_language_from_message(message) -> str:
     user = getattr(message, "from_user", None)
-    return language_for_user(user)
+    if user and not getattr(user, "is_bot", False):
+        remember_telegram_language(user.id, getattr(user, "language_code", None))
+        return language_for_user(user)
+    return language_for_chat(getattr(message, "chat_id", None))
 
 
 def _ui_language(update: Update) -> str:
@@ -335,12 +339,21 @@ async def menu_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.effective_message
     if not message or not is_private_owner(update):
         return
+    language = _ui_language(update)
+    label = (message.text or "").strip()
+    normalized_label = _normalize_menu_label(label)
+    action = next((
+        MENU_ACTIONS[index]
+        for labels in MENU_LABELS.values()
+        for index, item in enumerate(labels)
+        if _normalize_menu_label(item) == normalized_label
+    ), None)
+    if action == "cancel":
+        await cancel(update, context)
+        return
     if context.user_data.get("flow"):
         await free_text_message(update, context)
         return
-    language = _ui_language(update)
-    label = (message.text or "").strip()
-    action = next((MENU_ACTIONS[i] for i, item in enumerate(MENU_LABELS[language]) if item == label), None)
     if action == "profile":
         await profile_command(update, context)
     elif action == "search_jobs":
@@ -353,11 +366,13 @@ async def menu_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await language_command(update, context)
     elif action == "help":
         await show_info(update, context)
-    elif action == "cancel":
-        await cancel(update, context)
     else:
-        profile_labels = PROFILE_ACTION_LABELS[language]
-        profile_action = next((key for key, value in profile_labels.items() if value == label), None)
+        profile_action = next((
+            key
+            for profile_labels in PROFILE_ACTION_LABELS.values()
+            for key, value in profile_labels.items()
+            if _normalize_menu_label(value) == normalized_label
+        ), None)
         if profile_action == "complete":
             await complete_command(update, context)
         elif profile_action == "manage":
@@ -370,6 +385,12 @@ async def menu_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await start(update, context)
         else:
             await message.reply_text(translate_ui_text("Nie rozpoznałem tego przycisku. Użyj /start, aby odświeżyć menu.", language))
+
+
+def _normalize_menu_label(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value or "")
+    value = value.replace("\ufe0e", "").replace("\ufe0f", "")
+    return " ".join(value.split()).casefold()
 
 
 async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -897,7 +918,9 @@ async def delete_profile_command(update: Update, context: ContextTypes.DEFAULT_T
     await message.reply_text("Usunę zapisany profil kandydata. Oryginalny plik CV pozostanie lokalnie i będzie można ponownie go przeanalizować. Potwierdzasz?", reply_markup=keyboard)
 
 
-async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int) -> None:
+async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int, language: str | None = None) -> None:
+    global _last_pracuj_detail_request_at
+    language = normalize_language(language or _ui_language_from_message(message))
     page_size = 8
     start = (page - 1) * page_size
     visible = ranked[start:start + page_size]
@@ -912,20 +935,39 @@ async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int)
         offer, fit = row["offer"], row["fit"]
         if not isinstance(offer, dict) or not isinstance(fit, dict):
             continue
+        if (not offer.get("company") or not offer.get("location")) and offer.get("url"):
+            wait_seconds = 1.0 - (time.monotonic() - _last_pracuj_detail_request_at)
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+            try:
+                detailed = await asyncio.to_thread(enrich_pracuj_offer, JobOffer.model_validate(offer))
+                offer.update(detailed.model_dump(mode="json"))
+                row["offer"] = offer
+                save_search_results(ranked)
+            except Exception as exc:
+                LOGGER.warning("Pracuj offer detail enrichment failed (%s).", type(exc).__name__)
+            _last_pracuj_detail_request_at = time.monotonic()
         matching = ", ".join(fit.get("matching_requirements", [])) or "brak potwierdzonych dopasowań"
         gaps = ", ".join(fit.get("gaps", [])) or "brak wskazanych luk"
         title = str(offer.get("title") or "Oferta")
         details = []
-        for label, key in (("Forma zatrudnienia", "employment_type"), ("Wynagrodzenie", "salary"), ("Tryb pracy", "work_mode")):
+        for icon, label, key in (
+            ("📄", "Forma zatrudnienia", "employment_type"),
+            ("💵", "Wynagrodzenie", "salary"),
+            ("🏠", "Tryb pracy", "work_mode"),
+            ("🗓️", "Data publikacji", "posted_at"),
+        ):
             value = offer.get(key)
             if value:
-                details.append(f"{translate_ui_text(label, _ui_language_from_message(message))}: {value}")
+                details.append(f"{icon} {translate_ui_text(label, language)}: {value}")
         details_text = ("\n" + " | ".join(details)) if details else ""
+        company = offer.get("company") or translate_ui_text("Firma niepodana", language)
+        location = offer.get("location") or translate_ui_text("Lokalizacja niepodana", language)
         text = (
             f"{fit.get('color', '⚪')} Dopasowanie: {fit.get('score', 0)}%\n"
-            f"{title}\n{offer.get('company') or 'Firma niepodana'} | {offer.get('location') or 'Lokalizacja niepodana'}\n"
+            f"💼 {title}\n🏢 {company} | 📍 {location}\n"
             f"{details_text}\n"
-            f"Pasuje: {matching}\nBraki: {gaps}\n{fit.get('rationale', '')}\n{offer.get('url', '')}"
+            f"✅ Pasuje: {matching}\n⚠️ Braki: {gaps}\n{fit.get('rationale', '')}\n{offer.get('url', '')}"
         )
         action = "job:remove:" if offer.get("id") in chosen else "job:add:"
         label = "Usuń z wybranych" if offer.get("id") in chosen else "Wybieram tę ofertę"
@@ -933,9 +975,9 @@ async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int)
         await _send_split(message, text, keyboard)
     if start + page_size < len(ranked):
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Następne oferty", callback_data=f"job:page:{page + 1}")]])
-        await message.reply_text(format_ui("search_results_more", _ui_language_from_message(message), start=start + 1, end=start + len(visible), total=len(ranked)), reply_markup=keyboard)
+        await message.reply_text(format_ui("search_results_more", language, start=start + 1, end=start + len(visible), total=len(ranked)), reply_markup=keyboard)
     else:
-        await message.reply_text(format_ui("search_results_end", _ui_language_from_message(message), start=start + 1, end=start + len(visible), total=len(ranked)))
+        await message.reply_text(format_ui("search_results_end", language, start=start + 1, end=start + len(visible), total=len(ranked)))
 
 
 def _job_search_terms(profile: CandidateProfile, primary_query: str, related_titles: list[str] | None = None) -> list[str]:
@@ -966,13 +1008,29 @@ def _job_search_terms(profile: CandidateProfile, primary_query: str, related_tit
 
 
 async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: str, location: str | None, page: int = 1) -> None:
+    user_id = message.from_user.id if message.from_user else message.chat_id
+    active_task = _ACTIVE_JOB_SEARCHES.get(user_id)
+    if active_task and not active_task.done():
+        await message.reply_text(translate_ui_text("Wyszukiwanie już trwa. Zatrzymaj je przed uruchomieniem kolejnego.", _ui_language_from_message(message)))
+        return
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        _ACTIVE_JOB_SEARCHES[user_id] = current_task
+        current_task.add_done_callback(
+            lambda completed, owner=user_id: (
+                _ACTIVE_JOB_SEARCHES.pop(owner, None),
+                _ACTIVE_JOB_SEARCH_STATUSES.pop(owner, None),
+            ) if _ACTIVE_JOB_SEARCHES.get(owner) is completed else None
+        )
     active = _active_profile()
     if not active:
+        _ACTIVE_JOB_SEARCHES.pop(user_id, None)
         await message.reply_text("Najpierw zapisz aktywny profil poleceniem /analyze.")
         return
     profile = active[2]
     language = _ui_language_from_message(message)
     status = await message.reply_text(translate_ui_text("Rozpoczynam wyszukiwanie ofert na Pracuj.pl. Sprawdzę kolejne strony i zbliżone nazwy stanowisk.", language))
+    _ACTIVE_JOB_SEARCH_STATUSES[user_id] = status
     search_started = time.monotonic()
     terms = _job_search_terms(profile, query)
     preferred_mode = (profile.preferred_work_mode or "").casefold()
@@ -1085,7 +1143,7 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
     if rate_limited:
         completion_text += "\n\n" + translate_ui_text("Pracuj.pl ograniczył liczbę żądań. Pokazuję dotychczas zebrane oferty; spróbuj ponownie później.", language)
     await status.edit_text(completion_text)
-    await _send_ranked_jobs(message, all_ranked, 1)
+    await _send_ranked_jobs(message, all_ranked, 1, language)
 
 
 async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1421,18 +1479,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if action == "add" and current:
             toggle_selected_job(current["offer"], current.get("fit"))
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Usuń z wybranych", callback_data=f"job:remove:{job_id}")]])
-            await query.edit_message_reply_markup(reply_markup=keyboard)
+            await query.edit_message_reply_markup(reply_markup=localize_markup(keyboard, language))
             await query.message.reply_text("Oferta została dodana do wybranych. Zobacz listę przez /selected.")
         else:
             toggle_selected_job({"id": job_id})
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Wybieram tę ofertę", callback_data=f"job:add:{job_id}")]])
-            await query.edit_message_reply_markup(reply_markup=keyboard)
+            await query.edit_message_reply_markup(reply_markup=localize_markup(keyboard, language))
             await query.message.reply_text("Usunięto ofertę z wybranych.")
         return
     if data.startswith("job:page:"):
         page = int(data.rsplit(":", 1)[1])
         ranked = get_search_results()
-        await _send_ranked_jobs(query.message, ranked, page)
+        await _send_ranked_jobs(query.message, ranked, page, language)
         return
 
 
@@ -1541,6 +1599,23 @@ async def post_init(application: Application) -> None:
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    message = update.effective_message
+    user_id = user.id if user else None
+    active_task = _ACTIVE_JOB_SEARCHES.get(user_id) if user_id is not None else None
+    if active_task and not active_task.done() and active_task is not asyncio.current_task():
+        language = language_for_user(user) if user else "en"
+        active_task.cancel()
+        status = _ACTIVE_JOB_SEARCH_STATUSES.get(user_id)
+        stopped_text = translate_ui_text("Wyszukiwanie i ocena dopasowań zostały zatrzymane.", language)
+        try:
+            if status:
+                await status.edit_text(stopped_text)
+            elif message:
+                await message.reply_text(stopped_text)
+        except Exception as exc:
+            LOGGER.warning("Could not update the cancelled search status (%s).", type(exc).__name__)
+        return
     context.user_data.pop("pending_cv_path", None)
     context.user_data.pop("profile_draft", None)
     context.user_data.pop("profile_draft_source", None)
@@ -1549,10 +1624,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("profile_supplement_steps", None)
     context.user_data.pop("profile_supplement_working", None)
     context.user_data.pop("flow", None)
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            "Anulowano oczekującą operację. Zapisany oryginał CV pozostał na komputerze."
-        )
+    if message:
+        await message.reply_text(translate_ui_text(
+            "Anulowano oczekującą operację. Zapisany oryginał CV pozostał na komputerze.",
+            language_for_user(user) if user else "en",
+        ))
 
 
 
@@ -1581,7 +1657,7 @@ def main() -> None:
     if owner_id() is None:
         LOGGER.warning("TELEGRAM_OWNER_ID nie jest skonfigurowany.")
 
-    application = ApplicationBuilder().token(token).post_init(post_init).build()
+    application = ApplicationBuilder().token(token).post_init(post_init).concurrent_updates(4).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("id", show_id))
     application.add_handler(CommandHandler("analyze", analyze_command))

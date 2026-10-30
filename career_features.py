@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import logging
 import os
 import re
 import time
@@ -26,6 +27,7 @@ JOBS_DIR = DATA_DIR / "jobs"
 SELECTED_FILE = JOBS_DIR / "selected_jobs.json"
 SEARCH_FILE = JOBS_DIR / "latest_search.json"
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+LOGGER = logging.getLogger("wow_job_assistant")
 
 
 class StrictModel(BaseModel):
@@ -285,15 +287,29 @@ def _job_from_jsonld(item: dict[str, Any]) -> JobOffer | None:
         url = "https://www.pracuj.pl" + url
     if not url:
         url = "https://www.pracuj.pl/praca"
-    org = item.get("hiringOrganization") or {}
-    company = org.get("name") if isinstance(org, dict) else str(org)
+    org = item.get("hiringOrganization") or item.get("publisher") or {}
+    company = (org.get("name") or org.get("legalName")) if isinstance(org, dict) else str(org)
+    if company is not None:
+        company = " ".join(str(company).split()).strip() or None
     location = item.get("jobLocation") or {}
-    if isinstance(location, list):
-        location = location[0] if location else {}
-    address = location.get("address", {}) if isinstance(location, dict) else {}
-    if isinstance(address, list):
-        address = address[0] if address else {}
-    locality = address.get("addressLocality") if isinstance(address, dict) else None
+    locations = location if isinstance(location, list) else [location]
+    locality = None
+    for place in locations:
+        if not isinstance(place, dict):
+            continue
+        address = place.get("address", {})
+        addresses = address if isinstance(address, list) else [address]
+        for address_item in addresses:
+            if isinstance(address_item, dict):
+                locality = address_item.get("addressLocality") or address_item.get("addressRegion")
+                if locality:
+                    break
+        if locality:
+            break
+    if isinstance(locality, dict):
+        locality = locality.get("name") or locality.get("addressLocality")
+    if locality is not None:
+        locality = " ".join(str(locality).split()).strip() or None
     description = _plain_text(str(item.get("description") or ""))
     employment = item.get("employmentType")
     if isinstance(employment, list):
@@ -336,6 +352,85 @@ def _job_from_jsonld(item: dict[str, Any]) -> JobOffer | None:
         description=description[:12000], posted_at=item.get("datePosted"),
         employment_type=employment, salary=salary, work_mode=work_mode,
     )
+
+
+_POLISH_CITY_SLUGS = {
+    "bialystok": "Białystok", "bielsko-biala": "Bielsko-Biała", "bydgoszcz": "Bydgoszcz",
+    "czestochowa": "Częstochowa", "gdansk": "Gdańsk", "gdynia": "Gdynia",
+    "gliwice": "Gliwice", "gorzow-wielkopolski": "Gorzów Wielkopolski", "katowice": "Katowice",
+    "kielce": "Kielce", "krakow": "Kraków", "lublin": "Lublin", "lodz": "Łódź",
+    "olsztyn": "Olsztyn", "opole": "Opole", "poznan": "Poznań", "radom": "Radom",
+    "rzeszow": "Rzeszów", "sosnowiec": "Sosnowiec", "szczecin": "Szczecin",
+    "tarnow": "Tarnów", "torun": "Toruń", "warszawa": "Warszawa", "wroclaw": "Wrocław",
+    "zielona-gora": "Zielona Góra",
+}
+
+
+def _location_from_pracuj_url(url: str) -> str | None:
+    """Use the city suffix in a Pracuj offer URL when page metadata omits it."""
+    path = urllib.parse.urlsplit(url).path.casefold()
+    offer_slug = path.split(",oferta,", 1)[0]
+    for slug, city in sorted(_POLISH_CITY_SLUGS.items(), key=lambda item: len(item[0]), reverse=True):
+        if offer_slug.endswith("-" + slug):
+            return city
+    return None
+
+
+def enrich_pracuj_offer(offer: JobOffer) -> JobOffer:
+    """Fill missing employer/location/description from the public offer page."""
+    request = urllib.request.Request(offer.url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; WOWJobAssistant/1.0; +https://www.pracuj.pl/)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.7",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status != 200:
+                raise RuntimeError(f"Pracuj.pl zwrócił kod HTTP {response.status}.")
+            raw = response.read(8_000_000)
+            markup = raw.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, RuntimeError) as exc:
+        LOGGER.warning("Could not enrich Pracuj offer %s (%s).", offer.id, type(exc).__name__)
+        return offer.model_copy(update={"location": offer.location or _location_from_pracuj_url(offer.url)})
+
+    parser = _OfferParser()
+    parser.feed(markup)
+    detail: JobOffer | None = None
+    for script in parser.scripts:
+        try:
+            payload = json.loads(script)
+        except json.JSONDecodeError:
+            continue
+        for item in _walk_jsonld(payload):
+            candidate = _job_from_jsonld(item)
+            if candidate and (candidate.id == offer.id or candidate.url.rstrip("/") == offer.url.rstrip("/")):
+                detail = candidate
+                break
+        if detail:
+            break
+
+    if detail is None:
+        # Some Pracuj page revisions use a canonical URL without the offer id in JSON-LD.
+        for script in parser.scripts:
+            try:
+                payload = json.loads(script)
+            except json.JSONDecodeError:
+                continue
+            candidates = [candidate for item in _walk_jsonld(payload) if (candidate := _job_from_jsonld(item))]
+            if candidates:
+                detail = candidates[0]
+                break
+
+    if detail is None:
+        return offer.model_copy(update={"location": offer.location or _location_from_pracuj_url(offer.url)})
+    return offer.model_copy(update={
+        "company": offer.company or detail.company,
+        "location": offer.location or detail.location or _location_from_pracuj_url(offer.url),
+        "description": offer.description or detail.description,
+        "employment_type": offer.employment_type or detail.employment_type,
+        "salary": offer.salary or detail.salary,
+        "work_mode": offer.work_mode or detail.work_mode,
+    })
 
 
 def build_search_url(query: str, location: str | None = None, page: int = 1) -> str:

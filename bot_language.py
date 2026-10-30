@@ -1046,3 +1046,90 @@ _SEARCH_PROFILE_LABELS = {
 }
 for _source, _values in _SEARCH_PROFILE_LABELS.items():
     UI_PHRASES[_source] = dict(zip(("en", "ru", "uk", "es", "fr", "de"), _values))
+
+UI_PHRASES.update({
+    "Wyszukiwanie i ocena dopasowań zostały zatrzymane.": {
+        "en": "Job search and match assessment have been stopped.",
+        "ru": "Поиск вакансий и оценка соответствия остановлены.",
+        "uk": "Пошук вакансій та оцінювання відповідності зупинено.",
+        "es": "Se detuvieron la búsqueda de ofertas y la evaluación de compatibilidad.",
+        "fr": "La recherche d’offres et l’évaluation de la correspondance ont été arrêtées.",
+        "de": "Die Stellensuche und die Bewertung der Passgenauigkeit wurden gestoppt.",
+    },
+    "Wyszukiwanie już trwa. Zatrzymaj je przed uruchomieniem kolejnego.": {
+        "en": "A search is already running. Stop it before starting another one.",
+        "ru": "Поиск уже выполняется. Остановите его, прежде чем запускать новый.",
+        "uk": "Пошук уже триває. Зупиніть його, перш ніж запускати новий.",
+        "es": "Ya hay una búsqueda en curso. Deténla antes de iniciar otra.",
+        "fr": "Une recherche est déjà en cours. Arrêtez-la avant d’en lancer une autre.",
+        "de": "Eine Suche läuft bereits. Stoppe sie, bevor du eine neue startest.",
+    },
+    "Firma niepodana": {
+        "en": "Company not provided", "ru": "Компания не указана", "uk": "Компанію не вказано",
+        "es": "Empresa no indicada", "fr": "Entreprise non indiquée", "de": "Unternehmen nicht angegeben",
+    },
+    "Lokalizacja niepodana": {
+        "en": "Location not provided", "ru": "Местоположение не указано", "uk": "Місце розташування не вказано",
+        "es": "Ubicación no indicada", "fr": "Lieu non indiqué", "de": "Standort nicht angegeben",
+    },
+    "Data publikacji": {
+        "en": "Posted", "ru": "Опубликовано", "uk": "Опубліковано",
+        "es": "Publicado", "fr": "Publié le", "de": "Veröffentlicht",
+    },
+    "Aby przejść do pól formularza dla wybranej oferty, użyj /apply ID_OFERTY. Aplikację wysyłasz samodzielnie.": {
+        "en": "To review the application fields for a selected job, use /apply JOB_ID. You submit the application yourself.",
+        "ru": "Чтобы посмотреть поля формы выбранной вакансии, используйте /apply ID_ВАКАНСИИ. Заявку вы отправляете самостоятельно.",
+        "uk": "Щоб переглянути поля форми обраної вакансії, скористайтеся /apply ID_ВАКАНСІЇ. Заявку ви надсилаєте самостійно.",
+        "es": "Para revisar los campos del formulario de una oferta seleccionada, usa /apply ID_OFERTA. Tú envías la solicitud.",
+        "fr": "Pour consulter les champs du formulaire d’une offre sélectionnée, utilisez /apply ID_OFFRE. Vous envoyez vous-même la candidature.",
+        "de": "Um die Formularfelder einer ausgewählten Stelle zu prüfen, verwende /apply JOB_ID. Du sendest die Bewerbung selbst ab.",
+    },
+    "Profil powiązany pozostanie zapisany, ale nie będzie można ponownie odczytać jego źródłowego CV.": {
+        "en": "The linked profile will remain saved, but its source CV can no longer be read again.",
+        "ru": "Связанный профиль останется сохранённым, но исходное CV больше нельзя будет прочитать повторно.",
+        "uk": "Пов’язаний профіль залишиться збереженим, але вихідне CV більше не можна буде прочитати повторно.",
+        "es": "El perfil vinculado seguirá guardado, pero ya no se podrá volver a leer su CV de origen.",
+        "fr": "Le profil associé restera enregistré, mais son CV source ne pourra plus être lu à nouveau.",
+        "de": "Das verknüpfte Profil bleibt gespeichert, aber der ursprüngliche Lebenslauf kann nicht erneut eingelesen werden.",
+    },
+    "Oferta prowadzi do zewnętrznego systemu rekrutacyjnego.": {
+        "en": "This job opens an external recruitment system.",
+        "ru": "Вакансия ведёт во внешнюю систему подбора персонала.",
+        "uk": "Вакансія веде до зовнішньої системи рекрутингу.",
+        "es": "Esta oferta abre un sistema de selección externo.",
+        "fr": "Cette offre mène à un système de recrutement externe.",
+        "de": "Diese Stelle führt zu einem externen Bewerbungssystem.",
+    },
+    "Formularz wymaga logowania albo portal odmówił dostępu.": {
+        "en": "The form requires sign-in, or the portal denied access.",
+        "ru": "Форма требует входа в систему, либо портал отказал в доступе.",
+        "uk": "Форма потребує входу або портал відмовив у доступі.",
+        "es": "El formulario requiere iniciar sesión o el portal denegó el acceso.",
+        "fr": "Le formulaire nécessite une connexion ou le portail a refusé l’accès.",
+        "de": "Das Formular erfordert eine Anmeldung oder das Portal hat den Zugriff verweigert.",
+    },
+    "Formularz jest ładowany dynamicznie albo wymaga logowania.": {
+        "en": "The form loads dynamically or requires sign-in.",
+        "ru": "Форма загружается динамически или требует входа в систему.",
+        "uk": "Форма завантажується динамічно або потребує входу.",
+        "es": "El formulario se carga dinámicamente o requiere iniciar sesión.",
+        "fr": "Le formulaire se charge de façon dynamique ou nécessite une connexion.",
+        "de": "Das Formular wird dynamisch geladen oder erfordert eine Anmeldung.",
+    },
+    "Strona formularza przekracza limit odczytu.": {
+        "en": "The application form page exceeds the reading limit.",
+        "ru": "Страница формы превышает допустимый объём чтения.",
+        "uk": "Сторінка форми перевищує обмеження на обсяг зчитування.",
+        "es": "La página del formulario supera el límite de lectura.",
+        "fr": "La page du formulaire dépasse la limite de lecture.",
+        "de": "Die Formularseite überschreitet das Leselimit.",
+    },
+    "Nie udało się odczytać publicznego formularza.": {
+        "en": "Couldn't read the public application form.",
+        "ru": "Не удалось прочитать открытую форму заявки.",
+        "uk": "Не вдалося прочитати відкриту форму заявки.",
+        "es": "No se pudo leer el formulario público de solicitud.",
+        "fr": "Impossible de lire le formulaire public de candidature.",
+        "de": "Das öffentliche Bewerbungsformular konnte nicht gelesen werden.",
+    },
+})
