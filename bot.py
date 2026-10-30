@@ -12,6 +12,7 @@ from agents import Agent, RunConfig, Runner
 from pydantic import BaseModel, ConfigDict, Field
 from telegram import Bot, BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatType
+from telegram.error import TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -203,7 +204,7 @@ def main_menu_keyboard(language: str) -> ReplyKeyboardMarkup:
 def profile_menu_keyboard(language: str) -> ReplyKeyboardMarkup:
     labels = PROFILE_ACTION_LABELS.get(language, PROFILE_ACTION_LABELS["en"])
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(labels[key])] for key in ("complete", "manage", "delete", "back_main")],
+        [[KeyboardButton(labels[key])] for key in ("manage", "profile_manager", "back_main")],
         resize_keyboard=True, is_persistent=True,
     )
 
@@ -356,6 +357,8 @@ async def menu_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await complete_command(update, context)
         elif profile_action == "manage":
             await cvs_command(update, context)
+        elif profile_action == "profile_manager":
+            await candidate_profiles_command(update, context)
         elif profile_action == "delete":
             await delete_profile_command(update, context)
         elif profile_action == "back_main":
@@ -697,51 +700,96 @@ def list_local_cv_files() -> list[Path]:
     return sorted((path for path in DATA_DIR.iterdir() if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS), key=lambda path: path.stat().st_mtime, reverse=True)
 
 
+def _cv_list_keyboard(language: str) -> InlineKeyboardMarkup:
+    rows = []
+    for path in list_local_cv_files():
+        rows.append([InlineKeyboardButton(path.name[:60], callback_data=f"cv:select:{path.name}")])
+    rows.append([InlineKeyboardButton(translate_ui_text("🔙 Wróć do profilu", language), callback_data="profile:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _selected_cv_keyboard(path: Path, language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(translate_ui_text("Usuń CV", language), callback_data=f"cv:delete_confirm:{path.name}")],
+        [InlineKeyboardButton(translate_ui_text("Stwórz profil z CV jeszcze raz", language), callback_data=f"cv:analyze:{path.name}")],
+        [InlineKeyboardButton(translate_ui_text("🔙 Lista CV", language), callback_data="cv:list")],
+    ])
+
+
+def _candidate_profiles_keyboard(language: str) -> InlineKeyboardMarkup:
+    active_id = profile_registry().get("active_profile_id")
+    rows = []
+    for profile_id, record in list_profiles():
+        name = str(record.get("source_cv") or profile_id)
+        marker = "★ " if profile_id == active_id else ""
+        rows.append([InlineKeyboardButton(f"{marker}{name}"[:60], callback_data=f"profile:select:{profile_id}")])
+    rows.append([InlineKeyboardButton(translate_ui_text("🔙 Wróć do profilu", language), callback_data="profile:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def candidate_profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not is_private_owner(update):
+        return
+    language = _ui_language(update)
+    if not list_profiles():
+        await message.reply_text(translate_ui_text("Nie ma jeszcze zapisanych profili kandydata.", language), reply_markup=profile_menu_keyboard(language))
+        return
+    await message.reply_text(
+        translate_ui_text("Profile kandydatów. Wybierz profil do zarządzania:", language),
+        reply_markup=_candidate_profiles_keyboard(language),
+    )
+
+
+async def show_selected_profile(query, profile_id: str, language: str) -> None:
+    record = get_profile_record(profile_id)
+    if not record:
+        await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language), reply_markup=_candidate_profiles_keyboard(language))
+        return
+    name = str(record[1].get("source_cv") or profile_id)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(translate_ui_text("Uzupełnij profil", language), callback_data=f"profile:complete:{profile_id}")],
+        [InlineKeyboardButton(translate_ui_text("Usuń profil", language), callback_data=f"profile:delete_confirm:{profile_id}")],
+        [InlineKeyboardButton(translate_ui_text("Używaj do wyszukiwania ofert", language), callback_data=f"profile:use:{profile_id}")],
+        [InlineKeyboardButton(translate_ui_text("🔙 Lista profili", language), callback_data="profile:list")],
+    ])
+    await query.edit_message_text(format_ui("selected_profile", language, name=name), reply_markup=keyboard)
+
+
 async def cvs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message or not is_private_owner(update):
         if message:
-            await message.reply_text("Ten bot jest prywatny.")
+            await message.reply_text(translate_ui_text("Ten bot jest prywatny.", _ui_language(update)))
         return
-    profiles = list_profiles()
-    active_id = profile_registry().get("active_profile_id")
+    language = _ui_language(update)
     files = list_local_cv_files()
-    rows = []
-    if profiles:
-        rows.append([InlineKeyboardButton("Profile zapisane z CV:", callback_data="noop")])
-        for profile_id, record in profiles:
-            name = record.get("source_cv") or profile_id
-            marker = "★ " if profile_id == active_id else ""
-            rows.append([InlineKeyboardButton(f"{marker}{name}"[:60], callback_data=f"cv:active:{profile_id}")])
-    if files:
-        rows.append([InlineKeyboardButton("Lokalne pliki CV — wybierz, aby usunąć:", callback_data="noop")])
-        language = _ui_language(update)
-        for path in files:
-            rows.append([InlineKeyboardButton(format_ui("analyze_cv_button", language, filename=path.name)[:60], callback_data=f"cv:analyze:{path.name}")])
-            rows.append([InlineKeyboardButton(f"🗑️ {path.name}"[:60], callback_data=f"cv:delete_confirm:{path.name}")])
-    if not files and not profiles:
-        await message.reply_text("Nie ma zapisanych CV ani profili. Wyślij CV w tym czacie, aby je dodać.", reply_markup=profile_menu_keyboard(_ui_language(update)))
+    if not files:
+        await message.reply_text(
+            translate_ui_text("Nie ma lokalnie zapisanych plików CV. Wyślij CV w tym czacie, aby je dodać.", language),
+            reply_markup=_cv_list_keyboard(language),
+        )
         return
-    if profiles or files:
-        rows.append([InlineKeyboardButton("🔙 Wróć do profilu", callback_data="profile:back")])
-        await message.reply_text("Zarządzanie profilami i zapisanymi CV:", reply_markup=InlineKeyboardMarkup(rows))
+    await message.reply_text(
+        translate_ui_text("Twoje lokalne CV. Wybierz plik:", language),
+        reply_markup=_cv_list_keyboard(language),
+    )
 
 
-async def confirm_delete_cv(message, filename: str) -> None:
+async def confirm_delete_cv(query, filename: str, language: str) -> None:
     path = validate_cv_path(str(DATA_DIR / filename))
     if not path:
-        await message.reply_text("Nie znaleziono tego lokalnego CV.")
+        await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language))
         return
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Usuń wybrane CV", callback_data=f"cv:delete:{path.name}"),
-        InlineKeyboardButton("Anuluj", callback_data="cv:delete_cancel"),
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(translate_ui_text("Potwierdź usunięcie CV", language), callback_data=f"cv:delete:{path.name}")],
+        [InlineKeyboardButton(translate_ui_text("Anuluj", language), callback_data=f"cv:delete_cancel:{path.name}")],
+    ])
     linked = any(str(record.get("source_cv") or "") == path.name for _, record in list_profiles())
-    language = _ui_language_from_message(message)
     text = format_ui("delete_cv_confirm", language, filename=path.name)
     if linked:
         text += " " + translate_ui_text("Profil powiązany pozostanie zapisany, ale nie będzie można ponownie odczytać jego źródłowego CV.", language)
-    await message.reply_text(text, reply_markup=keyboard)
+    await query.edit_message_text(text, reply_markup=keyboard)
 
 
 async def use_cv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -756,23 +804,40 @@ async def use_cv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await cvs_command(update, context)
 
 
+async def _begin_profile_supplement(target, context: ContextTypes.DEFAULT_TYPE, profile_id: str, language: str) -> None:
+    record = get_profile_record(profile_id)
+    if not record:
+        error_text = translate_ui_text("Nie znaleziono tego profilu.", language)
+        if isinstance(target, CallbackQuery):
+            await target.edit_message_text(error_text)
+        else:
+            await target.reply_text(error_text)
+        return
+    profile = CandidateProfile.model_validate(record[1]["profile"])
+    questions = chr(10).join(f"• {question}" for question in profile.questions_for_candidate)
+    context.user_data["flow"] = "profile_supplement"
+    context.user_data["profile_supplement_target_id"] = profile_id
+    prompt = translate_ui_text("Wyślij brakujące informacje, które mam dopisać do profilu. Zapiszę je lokalnie.", language)
+    if questions:
+        prompt += chr(10) + chr(10) + translate_ui_text("CV wskazało do potwierdzenia:", language) + chr(10) + questions
+    prompt += chr(10) + translate_ui_text("Anuluj poleceniem /cancel.", language)
+    if isinstance(target, CallbackQuery):
+        await target.edit_message_text(prompt)
+    else:
+        await target.reply_text(prompt)
+
+
 async def complete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message or not is_private_owner(update):
         if message:
-            await message.reply_text("Ten bot jest prywatny.")
+            await message.reply_text(translate_ui_text("Ten bot jest prywatny.", _ui_language(update)))
         return
     active = _active_profile()
     if not active:
-        await message.reply_text("Najpierw zapisz profil poleceniem /analyze.")
+        await message.reply_text(translate_ui_text("Najpierw zapisz profil poleceniem /analyze.", _ui_language(update)))
         return
-    _, _, profile = active
-    questions = chr(10).join(f"• {question}" for question in profile.questions_for_candidate)
-    context.user_data["flow"] = "profile_supplement"
-    prompt = "Wyślij brakujące informacje, które mam dopisać do profilu. Zapiszę je lokalnie."
-    if questions:
-        prompt += chr(10) + chr(10) + "CV wskazało do potwierdzenia:" + chr(10) + questions
-    await message.reply_text(prompt + chr(10) + "Anuluj poleceniem /cancel.")
+    await _begin_profile_supplement(message, context, active[0], _ui_language(update))
 
 
 async def delete_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1028,19 +1093,23 @@ async def free_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     flow = context.user_data.get("flow")
     if flow == "profile_supplement":
-        active = _active_profile()
-        if not active:
+        profile_id = context.user_data.get("profile_supplement_target_id")
+        target = get_profile_record(profile_id) if profile_id else get_profile_record()
+        if not target:
             context.user_data.pop("flow", None)
-            await message.reply_text("Nie ma aktywnego profilu. Wyślij CV i uruchom /analyze.")
+            context.user_data.pop("profile_supplement_target_id", None)
+            await message.reply_text(translate_ui_text("Nie ma aktywnego profilu. Wyślij CV i uruchom /analyze.", _ui_language(update)))
             return
-        profile_id, _, profile = active
+        profile_id, record = target
+        profile = CandidateProfile.model_validate(record["profile"])
         value = (message.text or "").strip()
         if not value:
-            await message.reply_text("Wyślij tekstowe informacje do dopisania albo /cancel.")
+            await message.reply_text(translate_ui_text("Wyślij tekstowe informacje do dopisania albo /cancel.", _ui_language(update)))
             return
         updated = profile.model_copy(deep=True)
         updated.supplemental_information.append(value)
         context.user_data.pop("flow", None)
+        context.user_data.pop("profile_supplement_target_id", None)
         context.user_data["profile_supplement_draft"] = {"profile_id": profile_id, "profile": updated.model_dump(mode="json")}
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("Zapisz uzupełnienie", callback_data="profile_supplement:approve"),
@@ -1057,87 +1126,158 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     if not query:
         return
-    await query.answer()
+    try:
+        await query.answer()
+    except TimedOut:
+        LOGGER.warning("Telegram callback acknowledgement timed out; continuing with the requested action.")
     if not is_private_owner(update):
-        await query.edit_message_text("Ten bot jest prywatny.")
+        await query.edit_message_text(translate_ui_text("Ten bot jest prywatny.", _ui_language(update)))
         return
 
     data = query.data or ""
+    language = _ui_language(update)
     if data.startswith("cv:active:"):
         profile_id = data.split(":", 2)[2]
-        if set_active_profile(profile_id):
-            await query.edit_message_text(format_ui("active_profile_changed", _ui_language(update), id=profile_id))
-        else:
-            await query.edit_message_text("Nie znaleziono tego profilu.")
+        await show_selected_profile(query, profile_id, language)
         return
     if data == "profile:add":
-        context.user_data["flow"] = "profile_supplement"
-        await query.message.reply_text("Napisz dodatkowe informacje, których brakuje w profilu. Zapiszę je lokalnie. /cancel anuluje.")
+        active = _active_profile()
+        if active:
+            await _begin_profile_supplement(query, context, active[0], language)
+        else:
+            await query.message.reply_text(translate_ui_text("Nie ma aktywnego profilu.", language))
+        return
+    if data.startswith("profile:complete:"):
+        await _begin_profile_supplement(query, context, data.split(":", 2)[2], language)
+        return
+    if data == "profile:list":
+        if not list_profiles():
+            await query.edit_message_text(translate_ui_text("Nie ma jeszcze zapisanych profili kandydata.", language), reply_markup=profile_menu_keyboard(language))
+        else:
+            await query.edit_message_text(translate_ui_text("Profile kandydatów. Wybierz profil do zarządzania:", language), reply_markup=_candidate_profiles_keyboard(language))
+        return
+    if data.startswith("profile:select:"):
+        await show_selected_profile(query, data.split(":", 2)[2], language)
+        return
+    if data.startswith("profile:use:"):
+        profile_id = data.split(":", 2)[2]
+        if set_active_profile(profile_id):
+            await query.edit_message_text(format_ui("active_profile_changed", language, id=profile_id))
+        else:
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language))
+        return
+    if data.startswith("profile:delete_confirm:"):
+        profile_id = data.split(":", 2)[2]
+        if not get_profile_record(profile_id):
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language), reply_markup=_candidate_profiles_keyboard(language))
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(translate_ui_text("Potwierdź usunięcie profilu", language), callback_data=f"profile:delete:{profile_id}")],
+            [InlineKeyboardButton(translate_ui_text("Anuluj", language), callback_data=f"profile:select:{profile_id}")],
+        ])
+        await query.edit_message_text(translate_ui_text("Usunąć wybrany profil kandydata? Oryginalny plik CV pozostanie lokalnie.", language), reply_markup=keyboard)
         return
     if data == "profile_supplement:cancel":
         context.user_data.pop("profile_supplement_draft", None)
-        await query.edit_message_text("Anulowano. Zapisany profil nie został zmieniony.")
+        context.user_data.pop("profile_supplement_target_id", None)
+        await query.edit_message_text(translate_ui_text("Anulowano. Zapisany profil nie został zmieniony.", language))
         return
     if data == "profile_supplement:approve":
         draft = context.user_data.pop("profile_supplement_draft", None)
         if not draft or not update_active_profile(draft["profile_id"], draft["profile"]):
-            await query.edit_message_text("Nie udało się zapisać uzupełnienia. Profil mógł zostać usunięty.")
+            await query.edit_message_text(translate_ui_text("Nie udało się zapisać uzupełnienia. Profil mógł zostać usunięty.", language))
             return
-        await query.edit_message_text("Uzupełniony profil zapisano lokalnie w języku oryginalnego CV.")
+        await query.edit_message_text(translate_ui_text("Uzupełniony profil zapisano lokalnie w języku oryginalnego CV.", language))
         return
     if data == "profile:delete_confirm":
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Usuń profil", callback_data="profile:delete")],
-            [InlineKeyboardButton("Anuluj", callback_data="profile:delete_cancel")],
-        ])
-        await query.message.reply_text("Oryginalny plik CV pozostanie lokalnie. Usunąć zapisany profil?", reply_markup=keyboard)
-        return
-    if data == "profile:delete_cancel":
-        await query.edit_message_text("Anulowano. Profil pozostał zapisany.")
-        return
-    if data == "profile:delete":
         active = _active_profile()
         if not active:
-            await query.edit_message_text("Nie ma aktywnego profilu.")
+            await query.edit_message_text(translate_ui_text("Nie ma aktywnego profilu.", language))
             return
-        replacement = delete_profile_record(active[0])
-        key = "deleted_profile_with_replacement" if replacement else "deleted_profile_no_replacement"
-        await query.edit_message_text(format_ui(key, _ui_language(update), id=replacement or ""))
+        await query.edit_message_text(translate_ui_text("Usunąć wybrany profil kandydata? Oryginalny plik CV pozostanie lokalnie.", language), reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(translate_ui_text("Potwierdź usunięcie profilu", language), callback_data=f"profile:delete:{active[0]}")],
+            [InlineKeyboardButton(translate_ui_text("Anuluj", language), callback_data=f"profile:select:{active[0]}")],
+        ]))
+        return
+    if data.startswith("profile:delete:"):
+        profile_id = data.split(":", 2)[2]
+        selected_record = get_profile_record(profile_id)
+        if not selected_record:
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language), reply_markup=_candidate_profiles_keyboard(language))
+            return
+        was_active = profile_registry().get("active_profile_id") == profile_id
+        replacement = delete_profile_record(profile_id)
+        if was_active:
+            key = "deleted_profile_with_replacement" if replacement else "deleted_profile_no_replacement"
+            result = format_ui(key, language, id=replacement or "")
+        else:
+            result = translate_ui_text("Profil kandydata został usunięty.", language)
+        remaining = list_profiles()
+        await query.edit_message_text(result, reply_markup=_candidate_profiles_keyboard(language) if remaining else None)
+        return
+    if data == "profile:delete_cancel":
+        await query.edit_message_text(translate_ui_text("Anulowano. Profil pozostał zapisany.", language))
         return
     if data == "noop":
         return
     if data == "profile:back":
-        await query.message.reply_text("Otwieram profil użytkownika.", reply_markup=profile_menu_keyboard(_ui_language(update)))
+        await query.message.reply_text(translate_ui_text("Otwieram profil użytkownika.", language), reply_markup=profile_menu_keyboard(language))
+        return
+    if data == "cv:list":
+        files = list_local_cv_files()
+        title = "Twoje lokalne CV. Wybierz plik:" if files else "Nie ma lokalnie zapisanych plików CV. Wyślij CV w tym czacie, aby je dodać."
+        await query.edit_message_text(translate_ui_text(title, language), reply_markup=_cv_list_keyboard(language))
+        return
+    if data.startswith("cv:select:"):
+        path = validate_cv_path(str(DATA_DIR / data.split(":", 2)[2]))
+        if not path:
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language))
+            return
+        await query.edit_message_text(format_ui("selected_cv", language, filename=path.name), reply_markup=_selected_cv_keyboard(path, language))
         return
     if data.startswith("cv:analyze:"):
         path = validate_cv_path(str(DATA_DIR / data.split(":", 2)[2]))
         if not path:
-            await query.message.reply_text("Nie znaleziono tego lokalnego CV.")
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language))
             return
-        language = _ui_language(update)
         keyboard = ask_for_cv_consent(path, context)
-        await query.message.reply_text(translate_ui_text("Aby przygotować profil, wyodrębnię tekst z wybranego lokalnego CV i przekażę go do OpenAI API. Profil pokażę Ci do sprawdzenia, a zapiszę dopiero po zatwierdzeniu. Czy wyrażasz zgodę na wysłanie tekstu tego CV do OpenAI?", language), reply_markup=keyboard)
+        await query.edit_message_text(
+            translate_ui_text("Aby przygotować profil, wyodrębnię tekst z wybranego lokalnego CV i przekażę go do OpenAI API. Profil pokażę Ci do sprawdzenia, a zapiszę dopiero po zatwierdzeniu. Czy wyrażasz zgodę na wysłanie tekstu tego CV do OpenAI?", language),
+            reply_markup=keyboard,
+        )
         return
     if data.startswith("cv:delete_confirm:"):
-        await confirm_delete_cv(query.message, data.split(":", 2)[2])
+        await confirm_delete_cv(query, data.split(":", 2)[2], language)
+        return
+    if data.startswith("cv:delete_cancel:"):
+        filename = data.split(":", 2)[2]
+        path = validate_cv_path(str(DATA_DIR / filename))
+        if path:
+            await query.edit_message_text(format_ui("selected_cv", language, filename=path.name), reply_markup=_selected_cv_keyboard(path, language))
+        else:
+            await query.edit_message_text(translate_ui_text("Anulowano usuwanie CV. Plik pozostał zapisany.", language), reply_markup=_cv_list_keyboard(language))
         return
     if data == "cv:delete_cancel":
-        await query.edit_message_text("Anulowano usuwanie CV. Plik pozostał zapisany.")
+        await query.edit_message_text(translate_ui_text("Anulowano usuwanie CV. Plik pozostał zapisany.", language), reply_markup=_cv_list_keyboard(language))
         return
     if data.startswith("cv:delete:"):
         path = validate_cv_path(str(DATA_DIR / data.split(":", 2)[2]))
         if not path:
-            await query.edit_message_text("Nie znaleziono tego lokalnego CV.")
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language))
             return
         filename = path.name
         linked = any(str(record.get("source_cv") or "") == filename for _, record in list_profiles())
         try:
             path.unlink()
         except OSError:
-            await query.edit_message_text("Nie udało się usunąć pliku CV. Sprawdź uprawnienia do folderu data/cv.")
+            await query.edit_message_text(translate_ui_text("Nie udało się usunąć pliku CV. Sprawdź uprawnienia do folderu data/cv.", language))
             return
-        await query.edit_message_text(format_ui("deleted_cv_linked" if linked else "deleted_cv_plain", _ui_language(update), filename=filename))
-        await cvs_command(update, context)
+        confirmation_key = "deleted_cv_linked" if linked else "deleted_cv_plain"
+        confirmation = format_ui(confirmation_key, language, filename=filename)
+        try:
+            await query.edit_message_text(confirmation, reply_markup=_cv_list_keyboard(language))
+        except TimedOut:
+            LOGGER.warning("CV file deleted locally, but Telegram timed out before confirming the deletion.")
         return
     if data.startswith("job:add:") or data.startswith("job:remove:"):
         _, action, job_id = data.split(":", 2)
@@ -1268,6 +1408,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("pending_cv_path", None)
     context.user_data.pop("profile_draft", None)
     context.user_data.pop("profile_draft_source", None)
+    context.user_data.pop("profile_supplement_target_id", None)
+    context.user_data.pop("profile_supplement_draft", None)
+    context.user_data.pop("flow", None)
     if update.effective_message:
         await update.effective_message.reply_text(
             "Anulowano oczekującą operację. Zapisany oryginał CV pozostał na komputerze."

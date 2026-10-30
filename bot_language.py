@@ -929,3 +929,76 @@ _UI_COVERAGE_PATCH = {
 }
 for _source, _values in _UI_COVERAGE_PATCH.items():
     UI_PHRASES[_source] = dict(zip(("en", "ru", "uk", "es", "fr", "de"), _values))
+
+# Menus for choosing a local CV or a saved candidate profile.
+_PROFILE_MANAGER_LABELS = {
+    "pl": "🧑‍💼 Zarządzanie profilem kandydata",
+    "en": "🧑‍💼 Manage candidate profiles",
+    "ru": "🧑‍💼 Управление профилями кандидата",
+    "uk": "🧑‍💼 Керування профілями кандидата",
+    "es": "🧑‍💼 Gestionar perfiles de candidato",
+    "fr": "🧑‍💼 Gérer les profils candidat",
+    "de": "🧑‍💼 Kandidatenprofile verwalten",
+}
+for _language, _label in _PROFILE_MANAGER_LABELS.items():
+    PROFILE_ACTION_LABELS[_language]["profile_manager"] = _label
+
+_PROFILE_MANAGER_PHRASES = {
+    "Twoje lokalne CV. Wybierz plik:": [
+        "Your local CVs. Select a file:", "Ваши локальные CV. Выберите файл:", "Ваші локальні CV. Виберіть файл:",
+        "Tus CV locales. Selecciona un archivo:", "Vos CV locaux. Sélectionnez un fichier :", "Deine lokalen Lebensläufe. Wähle eine Datei:",
+    ],
+    "Nie ma lokalnie zapisanych plików CV. Wyślij CV w tym czacie, aby je dodać.": [
+        "There are no CV files saved locally. Send a CV in this chat to add one.",
+        "Локально сохранённых файлов CV нет. Отправьте CV в этот чат, чтобы добавить его.",
+        "Локально збережених файлів CV немає. Надішліть CV у цей чат, щоб додати його.",
+        "No hay archivos CV guardados localmente. Envía uno en este chat para añadirlo.",
+        "Aucun fichier CV n’est enregistré localement. Envoyez-en un dans ce chat pour l’ajouter.",
+        "Es sind keine Lebensläufe lokal gespeichert. Sende hier einen, um ihn hinzuzufügen.",
+    ],
+    "Nie ma jeszcze zapisanych profili kandydata.": [
+        "There are no saved candidate profiles yet.", "Пока нет сохранённых профилей кандидата.", "Збережених профілів кандидата ще немає.",
+        "Aún no hay perfiles de candidato guardados.", "Aucun profil candidat n’est encore enregistré.", "Es sind noch keine Kandidatenprofile gespeichert.",
+    ],
+    "Profile kandydatów. Wybierz profil do zarządzania:": [
+        "Candidate profiles. Select a profile to manage:", "Профили кандидата. Выберите профиль для управления:", "Профілі кандидата. Виберіть профіль для керування:",
+        "Perfiles de candidato. Selecciona uno para gestionarlo:", "Profils candidat. Sélectionnez un profil à gérer :", "Kandidatenprofile. Wähle ein Profil zur Verwaltung:",
+    ],
+    "Używaj do wyszukiwania ofert": [
+        "Use for job searches", "Использовать для поиска вакансий", "Використовувати для пошуку вакансій",
+        "Usar para buscar ofertas", "Utiliser pour rechercher des offres", "Für die Stellensuche verwenden",
+    ],
+    "🔙 Lista CV": ["🔙 CV list", "🔙 Список CV", "🔙 Список CV", "🔙 Lista de CV", "🔙 Liste des CV", "🔙 CV-Liste"],
+    "🔙 Lista profili": ["🔙 Profile list", "🔙 Список профилей", "🔙 Список профілів", "🔙 Lista de perfiles", "🔙 Liste des profils", "🔙 Profilliste"],
+    "Usuń CV": ["Delete CV", "Удалить CV", "Видалити CV", "Eliminar CV", "Supprimer le CV", "Lebenslauf löschen"],
+    "Stwórz profil z CV jeszcze raz": [
+        "Create a profile from this CV again", "Повторно создать профиль по этому CV", "Створити профіль із цього CV ще раз",
+        "Crear un perfil de nuevo a partir de este CV", "Recréer un profil à partir de ce CV", "Aus diesem Lebenslauf erneut ein Profil erstellen",
+    ],
+    "Potwierdź usunięcie CV": ["Confirm CV deletion", "Подтвердить удаление CV", "Підтвердити видалення CV", "Confirmar eliminación del CV", "Confirmer la suppression du CV", "Löschen des Lebenslaufs bestätigen"],
+    "Potwierdź usunięcie profilu": ["Confirm profile deletion", "Подтвердить удаление профиля", "Підтвердити видалення профілю", "Confirmar eliminación del perfil", "Confirmer la suppression du profil", "Löschen des Profils bestätigen"],
+    "Usunąć wybrany profil kandydata? Oryginalny plik CV pozostanie lokalnie.": [
+        "Delete the selected candidate profile? The original CV file will remain stored locally.",
+        "Удалить выбранный профиль кандидата? Исходный файл CV останется локально.",
+        "Видалити вибраний профіль кандидата? Оригінальний файл CV залишиться локально.",
+        "¿Eliminar el perfil seleccionado? El archivo CV original seguirá guardado localmente.",
+        "Supprimer le profil sélectionné ? Le fichier CV d’origine restera enregistré localement.",
+        "Das ausgewählte Kandidatenprofil löschen? Die ursprüngliche CV-Datei bleibt lokal gespeichert.",
+    ],
+    "Profil kandydata został usunięty.": ["Candidate profile deleted.", "Профиль кандидата удалён.", "Профіль кандидата видалено.", "Perfil de candidato eliminado.", "Profil candidat supprimé.", "Kandidatenprofil gelöscht."],
+    "Nie udało się usunąć profilu.": ["Couldn't delete the profile.", "Не удалось удалить профиль.", "Не вдалося видалити профіль.", "No se pudo eliminar el perfil.", "Impossible de supprimer le profil.", "Das Profil konnte nicht gelöscht werden."],
+}
+for _source, _translations in _PROFILE_MANAGER_PHRASES.items():
+    UI_PHRASES[_source] = dict(zip(("en", "ru", "uk", "es", "fr", "de"), _translations))
+
+UI_FORMATS["selected_cv"] = {
+    "pl": "Wybrane CV: {filename}", "en": "Selected CV: {filename}", "ru": "Выбрано CV: {filename}",
+    "uk": "Вибране CV: {filename}", "es": "CV seleccionado: {filename}", "fr": "CV sélectionné : {filename}",
+    "de": "Ausgewählter Lebenslauf: {filename}",
+}
+UI_FORMATS["selected_profile"] = {
+    "pl": "Wybrany profil kandydata: {name}", "en": "Selected candidate profile: {name}",
+    "ru": "Выбранный профиль кандидата: {name}", "uk": "Вибраний профіль кандидата: {name}",
+    "es": "Perfil de candidato seleccionado: {name}", "fr": "Profil candidat sélectionné : {name}",
+    "de": "Ausgewähltes Kandidatenprofil: {name}",
+}
