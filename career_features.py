@@ -20,17 +20,44 @@ from pydantic import BaseModel, ConfigDict, Field
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-PROFILE_DIR = DATA_DIR / "profile"
-PROFILE_FILE = PROFILE_DIR / "candidate_profile.json"
-PROFILE_INDEX = PROFILE_DIR / "profiles.json"
-JOBS_DIR = DATA_DIR / "jobs"
-SELECTED_FILE = JOBS_DIR / "selected_jobs.json"
-SEARCH_FILE = JOBS_DIR / "latest_search.json"
-AI_CACHE_FILE = JOBS_DIR / "ai_cache.json"
+USERS_DIR = DATA_DIR / "users"
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 LOGGER = logging.getLogger("wow_job_assistant")
 CACHE_SCHEMA_VERSION = 1
 CACHE_MAX_ENTRIES = 2000
+
+
+def user_data_dir(user_id: int) -> Path:
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("A valid Telegram user ID is required for user data access.")
+    USERS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        try:
+            USERS_DIR.chmod(0o700)
+        except OSError as exc:
+            LOGGER.warning("Could not restrict permissions on the users data folder (%s).", type(exc).__name__)
+    directory = USERS_DIR / str(user_id)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        try:
+            directory.chmod(0o700)
+        except OSError as exc:
+            LOGGER.warning("Could not restrict permissions on a user's data folder (%s).", type(exc).__name__)
+    return directory
+
+
+def user_cv_dir(user_id: int) -> Path:
+    return user_data_dir(user_id) / "cv"
+
+
+def _profile_paths(user_id: int) -> tuple[Path, Path]:
+    directory = user_data_dir(user_id) / "profile"
+    return directory / "candidate_profile.json", directory / "profiles.json"
+
+
+def _job_paths(user_id: int) -> tuple[Path, Path, Path]:
+    directory = user_data_dir(user_id) / "jobs"
+    return directory / "selected_jobs.json", directory / "latest_search.json", directory / "ai_cache.json"
 
 
 class StrictModel(BaseModel):
@@ -98,25 +125,31 @@ def _now() -> str:
 
 
 def _atomic_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        try:
+            path.parent.chmod(0o700)
+        except OSError as exc:
+            LOGGER.warning("Could not restrict permissions on a user data folder (%s).", type(exc).__name__)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
 
 
-def profile_registry() -> dict[str, Any]:
-    if PROFILE_INDEX.is_file():
+def profile_registry(user_id: int) -> dict[str, Any]:
+    profile_file, profile_index = _profile_paths(user_id)
+    if profile_index.is_file():
         try:
-            value = json.loads(PROFILE_INDEX.read_text(encoding="utf-8"))
+            value = json.loads(profile_index.read_text(encoding="utf-8"))
             if isinstance(value, dict) and isinstance(value.get("profiles"), dict):
                 return value
         except (OSError, json.JSONDecodeError):
             pass
     registry: dict[str, Any] = {"active_profile_id": None, "profiles": {}}
     # Migrate the earlier single-profile format lazily, without opening the CV itself.
-    if PROFILE_FILE.is_file():
+    if profile_file.is_file():
         try:
-            legacy = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+            legacy = json.loads(profile_file.read_text(encoding="utf-8"))
             profile = legacy.get("profile") if isinstance(legacy, dict) else None
             if isinstance(profile, dict):
                 cv_name = legacy.get("source_cv") or "legacy-profile"
@@ -133,8 +166,8 @@ def profile_registry() -> dict[str, Any]:
     return registry
 
 
-def save_approved_profile(profile: dict[str, Any], source_cv: str | None) -> str:
-    registry = profile_registry()
+def save_approved_profile(user_id: int, profile: dict[str, Any], source_cv: str | None) -> str:
+    registry = profile_registry(user_id)
     profile_id = Path(source_cv).stem if source_cv else f"profile-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     profile_id = re.sub(r"[^A-Za-z0-9_-]", "", profile_id)[:40] or "profile"
     registry["profiles"][profile_id] = {
@@ -144,14 +177,15 @@ def save_approved_profile(profile: dict[str, Any], source_cv: str | None) -> str
         "languages": {"original": profile},
     }
     registry["active_profile_id"] = profile_id
-    _atomic_json(PROFILE_INDEX, registry)
+    profile_file, profile_index = _profile_paths(user_id)
+    _atomic_json(profile_index, registry)
     # Keep the previous file available for compatibility with the original project.
-    _atomic_json(PROFILE_FILE, {"approved_at": _now(), "source_cv": source_cv, "profile": profile})
+    _atomic_json(profile_file, {"approved_at": _now(), "source_cv": source_cv, "profile": profile})
     return profile_id
 
 
-def get_profile_record(profile_id: str | None = None) -> tuple[str, dict[str, Any]] | None:
-    registry = profile_registry()
+def get_profile_record(user_id: int, profile_id: str | None = None) -> tuple[str, dict[str, Any]] | None:
+    registry = profile_registry(user_id)
     key = profile_id or registry.get("active_profile_id")
     record = registry.get("profiles", {}).get(key) if key else None
     if not record:
@@ -163,35 +197,36 @@ def get_profile_record(profile_id: str | None = None) -> tuple[str, dict[str, An
     return key, {**record, "profile": profile, "language": "original"}
 
 
-def list_profiles() -> list[tuple[str, dict[str, Any]]]:
-    registry = profile_registry()
+def list_profiles(user_id: int) -> list[tuple[str, dict[str, Any]]]:
+    registry = profile_registry(user_id)
     return list(registry.get("profiles", {}).items())
 
 
-def set_active_profile(profile_id: str) -> bool:
-    registry = profile_registry()
+def set_active_profile(user_id: int, profile_id: str) -> bool:
+    registry = profile_registry(user_id)
     if profile_id not in registry.get("profiles", {}):
         return False
     registry["active_profile_id"] = profile_id
-    _atomic_json(PROFILE_INDEX, registry)
+    _atomic_json(_profile_paths(user_id)[1], registry)
     return True
 
 
-def update_active_profile(profile_id: str, profile: dict[str, Any]) -> bool:
-    registry = profile_registry()
+def update_active_profile(user_id: int, profile_id: str, profile: dict[str, Any]) -> bool:
+    registry = profile_registry(user_id)
     record = registry.get("profiles", {}).get(profile_id)
     if not record:
         return False
     record["languages"] = {"original": profile}
     record["active_language"] = "original"
     record["updated_at"] = _now()
-    _atomic_json(PROFILE_INDEX, registry)
-    _atomic_json(PROFILE_FILE, {"approved_at": _now(), "source_cv": record.get("source_cv"), "profile": profile})
+    profile_file, profile_index = _profile_paths(user_id)
+    _atomic_json(profile_index, registry)
+    _atomic_json(profile_file, {"approved_at": _now(), "source_cv": record.get("source_cv"), "profile": profile})
     return True
 
 
-def delete_profile_record(profile_id: str) -> str | None:
-    registry = profile_registry()
+def delete_profile_record(user_id: int, profile_id: str) -> str | None:
+    registry = profile_registry(user_id)
     records = registry.get("profiles", {})
     if profile_id not in records:
         return None
@@ -199,15 +234,16 @@ def delete_profile_record(profile_id: str) -> str | None:
     active = registry.get("active_profile_id")
     if active == profile_id:
         registry["active_profile_id"] = next(iter(records), None)
-    _atomic_json(PROFILE_INDEX, registry)
+    profile_file, profile_index = _profile_paths(user_id)
+    _atomic_json(profile_index, registry)
     # The original CV is intentionally retained so it can be analyzed again later.
     replacement = registry.get("active_profile_id")
     if replacement:
-        active_record = get_profile_record(replacement)
+        active_record = get_profile_record(user_id, replacement)
         if active_record:
-            _atomic_json(PROFILE_FILE, {"approved_at": _now(), "source_cv": active_record[1].get("source_cv"), "profile": active_record[1]["profile"]})
-    elif PROFILE_FILE.exists():
-        PROFILE_FILE.unlink()
+            _atomic_json(profile_file, {"approved_at": _now(), "source_cv": active_record[1].get("source_cv"), "profile": active_record[1]["profile"]})
+    elif profile_file.exists():
+        profile_file.unlink()
     return replacement
 
 
@@ -224,20 +260,21 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _read_ai_cache() -> dict[str, Any]:
+def _read_ai_cache(user_id: int) -> dict[str, Any]:
+    _, _, cache_file = _job_paths(user_id)
     try:
-        value = json.loads(AI_CACHE_FILE.read_text(encoding="utf-8"))
+        value = json.loads(cache_file.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 
 
-def _cache_get(key: str, max_age_seconds: int) -> Any | None:
-    return _cache_get_many([key], max_age_seconds).get(key)
+def _cache_get(user_id: int, key: str, max_age_seconds: int) -> Any | None:
+    return _cache_get_many(user_id, [key], max_age_seconds).get(key)
 
 
-def _cache_get_many(keys: list[str], max_age_seconds: int) -> dict[str, Any]:
-    cache = _read_ai_cache()
+def _cache_get_many(user_id: int, keys: list[str], max_age_seconds: int) -> dict[str, Any]:
+    cache = _read_ai_cache(user_id)
     now = time.time()
     found: dict[str, Any] = {}
     for key in keys:
@@ -250,12 +287,12 @@ def _cache_get_many(keys: list[str], max_age_seconds: int) -> dict[str, Any]:
     return found
 
 
-def _cache_set(key: str, value: Any) -> None:
-    _cache_set_many({key: value})
+def _cache_set(user_id: int, key: str, value: Any) -> None:
+    _cache_set_many(user_id, {key: value})
 
 
-def _cache_set_many(values: dict[str, Any]) -> None:
-    cache = _read_ai_cache()
+def _cache_set_many(user_id: int, values: dict[str, Any]) -> None:
+    cache = _read_ai_cache(user_id)
     now = time.time()
     for key, value in values.items():
         cache[key] = {"created_at": now, "value": value}
@@ -267,7 +304,7 @@ def _cache_set_many(values: dict[str, Any]) -> None:
     if len(cache) > CACHE_MAX_ENTRIES:
         cache = dict(sorted(cache.items(), key=lambda pair: pair[1]["created_at"])[-CACHE_MAX_ENTRIES:])
     try:
-        _atomic_json(AI_CACHE_FILE, cache)
+        _atomic_json(_job_paths(user_id)[2], cache)
     except OSError as exc:
         LOGGER.warning("AI cache write failed (%s); continuing without persistent cache.", type(exc).__name__)
 
@@ -601,6 +638,7 @@ def fetch_pracuj_jobs(query: str, location: str | None = None, page: int = 1) ->
 
 
 async def expand_job_search_inputs(
+    user_id: int,
     profile: dict[str, Any],
     search_language: str = "pl",
     requested_locations: list[str] | None = None,
@@ -623,7 +661,7 @@ async def expand_job_search_inputs(
         "language": search_language, "evidence": evidence, "locations": source_locations,
         "portal_locale": portal_locale, "portal_country": portal_country,
     })
-    cached = _cache_get(cache_key, 30 * 24 * 60 * 60)
+    cached = _cache_get(user_id, cache_key, 30 * 24 * 60 * 60)
     if isinstance(cached, dict):
         titles = cached.get("titles", [])
         normalized = cached.get("normalized_locations", source_locations)
@@ -666,11 +704,11 @@ async def expand_job_search_inputs(
         value = " ".join(str(candidate or "").split()).strip()
         normalized_clean.append(value or original)
     result_value = {"titles": clean[:4], "normalized_locations": normalized_clean}
-    _cache_set(cache_key, result_value)
+    _cache_set(user_id, cache_key, result_value)
     return result_value["titles"], result_value["normalized_locations"]
 
 
-async def rank_jobs(profile: dict[str, Any], offers: list[JobOffer], language: str = "pl") -> list[dict[str, Any]]:
+async def rank_jobs(user_id: int, profile: dict[str, Any], offers: list[JobOffer], language: str = "pl") -> list[dict[str, Any]]:
     if not offers:
         return []
     matching_profile = _matching_profile(profile)
@@ -684,7 +722,7 @@ async def rank_jobs(profile: dict[str, Any], offers: list[JobOffer], language: s
         })
         for offer in offers
     }
-    cached_fits = _cache_get_many(list(offer_cache_keys.values()), 14 * 24 * 60 * 60)
+    cached_fits = _cache_get_many(user_id, list(offer_cache_keys.values()), 14 * 24 * 60 * 60)
     for offer in offers:
         cached = cached_fits.get(offer_cache_keys[offer.id])
         if isinstance(cached, dict) and cached.get("id") == offer.id:
@@ -718,7 +756,7 @@ async def rank_jobs(profile: dict[str, Any], offers: list[JobOffer], language: s
             fits_by_id[offer.id] = fit
             new_cache_entries[offer_cache_keys[offer.id]] = fit
         if new_cache_entries:
-            _cache_set_many(new_cache_entries)
+            _cache_set_many(user_id, new_cache_entries)
     ranked = []
     for offer in offers:
         fit = fits_by_id.get(offer.id)
@@ -748,38 +786,40 @@ async def assess_application_fields(profile: dict[str, Any], offer: dict[str, An
     return [row.model_dump() for row in parsed.fields]
 
 
-def selected_jobs() -> dict[str, Any]:
-    if not SELECTED_FILE.is_file():
+def selected_jobs(user_id: int) -> dict[str, Any]:
+    selected_file = _job_paths(user_id)[0]
+    if not selected_file.is_file():
         return {"jobs": {}}
     try:
-        payload = json.loads(SELECTED_FILE.read_text(encoding="utf-8"))
+        payload = json.loads(selected_file.read_text(encoding="utf-8"))
         return payload if isinstance(payload, dict) else {"jobs": {}}
     except (OSError, json.JSONDecodeError):
         return {"jobs": {}}
 
 
-def toggle_selected_job(offer: dict[str, Any], fit: dict[str, Any] | None = None) -> bool:
-    payload = selected_jobs()
+def toggle_selected_job(user_id: int, offer: dict[str, Any], fit: dict[str, Any] | None = None) -> bool:
+    payload = selected_jobs(user_id)
     jobs = payload.setdefault("jobs", {})
     job_id = offer["id"]
     if job_id in jobs:
         del jobs[job_id]
-        _atomic_json(SELECTED_FILE, payload)
+        _atomic_json(_job_paths(user_id)[0], payload)
         return False
     jobs[job_id] = {"offer": offer, "fit": fit or {}, "selected_at": _now()}
-    _atomic_json(SELECTED_FILE, payload)
+    _atomic_json(_job_paths(user_id)[0], payload)
     return True
 
 
-def save_search_results(results: list[dict[str, Any]]) -> None:
-    _atomic_json(SEARCH_FILE, {"updated_at": _now(), "results": results})
+def save_search_results(user_id: int, results: list[dict[str, Any]]) -> None:
+    _atomic_json(_job_paths(user_id)[1], {"updated_at": _now(), "results": results})
 
 
-def get_search_results() -> list[dict[str, Any]]:
-    if not SEARCH_FILE.is_file():
+def get_search_results(user_id: int) -> list[dict[str, Any]]:
+    search_file = _job_paths(user_id)[1]
+    if not search_file.is_file():
         return []
     try:
-        value = json.loads(SEARCH_FILE.read_text(encoding="utf-8"))
+        value = json.loads(search_file.read_text(encoding="utf-8"))
         rows = value.get("results", []) if isinstance(value, dict) else []
         return rows if isinstance(rows, list) else []
     except (OSError, json.JSONDecodeError):

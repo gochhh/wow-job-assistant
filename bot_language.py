@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent
-SETTINGS_FILE = BASE_DIR / "data" / "bot_settings.json"
+USERS_DIR = BASE_DIR / "data" / "users"
 SUPPORTED_LANGUAGES = ("pl", "en", "ru", "uk", "es", "fr", "de")
 LANGUAGE_NAMES = {
     "pl": "Polski", "en": "English", "ru": "Русский", "uk": "Українська",
@@ -41,13 +41,13 @@ SEARCH_SETTINGS_TEXT = {
 }
 
 PROFILE_ACTION_LABELS = {
-    "pl": {"complete":"✍️ Uzupełnij profil","manage":"📚 Zarządzaj CV","language":"🌐 Język profilu","delete":"🗑️ Usuń aktywny profil","back_main":"🔙 Menu główne","back_profile":"🔙 Wróć do profilu"},
-    "en": {"complete":"✍️ Complete profile","manage":"📚 Manage CVs","language":"🌐 Profile language","delete":"🗑️ Delete active profile","back_main":"🔙 Main menu","back_profile":"🔙 Back to profile"},
-    "ru": {"complete":"✍️ Дополнить профиль","manage":"📚 Управление CV","language":"🌐 Язык профиля","delete":"🗑️ Удалить активный профиль","back_main":"🔙 Главное меню","back_profile":"🔙 Назад к профилю"},
-    "uk": {"complete":"✍️ Доповнити профіль","manage":"📚 Керувати CV","language":"🌐 Мова профілю","delete":"🗑️ Видалити активний профіль","back_main":"🔙 Головне меню","back_profile":"🔙 Назад до профілю"},
-    "es": {"complete":"✍️ Completar perfil","manage":"📚 Gestionar CV","language":"🌐 Idioma del perfil","delete":"🗑️ Eliminar perfil activo","back_main":"🔙 Menú principal","back_profile":"🔙 Volver al perfil"},
-    "fr": {"complete":"✍️ Compléter le profil","manage":"📚 Gérer les CV","language":"🌐 Langue du profil","delete":"🗑️ Supprimer le profil actif","back_main":"🔙 Menu principal","back_profile":"🔙 Retour au profil"},
-    "de": {"complete":"✍️ Profil ergänzen","manage":"📚 Lebensläufe verwalten","language":"🌐 Profilsprache","delete":"🗑️ Aktives Profil löschen","back_main":"🔙 Hauptmenü","back_profile":"🔙 Zurück zum Profil"},
+    "pl": {"complete":"✍️ Uzupełnij profil","manage":"📚 Zarządzaj CV","profile_manager":"🪪 Zarządzaj profilami","language":"🌐 Język profilu","delete":"🗑️ Usuń aktywny profil","back_main":"🔙 Menu główne","back_profile":"🔙 Wróć do profilu"},
+    "en": {"complete":"✍️ Complete profile","manage":"📚 Manage CVs","profile_manager":"🪪 Manage candidate profiles","language":"🌐 Profile language","delete":"🗑️ Delete active profile","back_main":"🔙 Main menu","back_profile":"🔙 Back to profile"},
+    "ru": {"complete":"✍️ Дополнить профиль","manage":"📚 Управление CV","profile_manager":"🪪 Управление профилями","language":"🌐 Язык профиля","delete":"🗑️ Удалить активный профиль","back_main":"🔙 Главное меню","back_profile":"🔙 Назад к профилю"},
+    "uk": {"complete":"✍️ Доповнити профіль","manage":"📚 Керувати CV","profile_manager":"🪪 Керувати профілями","language":"🌐 Мова профілю","delete":"🗑️ Видалити активний профіль","back_main":"🔙 Головне меню","back_profile":"🔙 Назад до профілю"},
+    "es": {"complete":"✍️ Completar perfil","manage":"📚 Gestionar CV","profile_manager":"🪪 Gestionar perfiles","language":"🌐 Idioma del perfil","delete":"🗑️ Eliminar perfil activo","back_main":"🔙 Menú principal","back_profile":"🔙 Volver al perfil"},
+    "fr": {"complete":"✍️ Compléter le profil","manage":"📚 Gérer les CV","profile_manager":"🪪 Gérer les profils","language":"🌐 Langue du profil","delete":"🗑️ Supprimer le profil actif","back_main":"🔙 Menu principal","back_profile":"🔙 Retour au profil"},
+    "de": {"complete":"✍️ Profil ergänzen","manage":"📚 Lebensläufe verwalten","profile_manager":"🪪 Profile verwalten","language":"🌐 Profilsprache","delete":"🗑️ Aktives Profil löschen","back_main":"🔙 Hauptmenü","back_profile":"🔙 Zurück zum Profil"},
 }
 PROFILE_EMPTY_TEXT = {
     "pl":"Nie ma zapisanego profilu. Wyślij CV w tym czacie; zapytam, czy przygotować z niego profil.",
@@ -113,9 +113,28 @@ def normalize_language(language: str | None) -> str:
     return code if code in SUPPORTED_LANGUAGES else "en"
 
 
-def _read_settings() -> dict[str, Any]:
+def _settings_file(user_id: int) -> Path:
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("A valid Telegram user ID is required for settings access.")
+    USERS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        try:
+            USERS_DIR.chmod(0o700)
+        except OSError:
+            pass
+    directory = USERS_DIR / str(user_id)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
+    return directory / "settings.json"
+
+
+def _read_settings(user_id: int) -> dict[str, Any]:
     try:
-        value = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        value = json.loads(_settings_file(user_id).read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
@@ -125,39 +144,32 @@ def language_for_user(user: object | None) -> str:
     if user is None:
         return "en"
     user_id = getattr(user, "id", None)
-    settings = _read_settings()
-    users = settings.get("users", {})
-    preference = users.get(str(user_id), {}) if isinstance(users, dict) else {}
-    manual = preference.get("language") if isinstance(preference, dict) else None
+    settings = _read_settings(user_id)
+    manual = settings.get("language")
     if manual in SUPPORTED_LANGUAGES:
         return manual
     return normalize_language(getattr(user, "language_code", None))
 
 
-def set_user_language(user_id: int, language: str | None) -> None:
-    settings = _read_settings()
-    users = settings.setdefault("users", {})
-    key = str(user_id)
-    preference = users.setdefault(key, {})
-    if not isinstance(preference, dict):
-        preference = {}
-        users[key] = preference
-    if language is None:
-        preference.pop("language", None)
-    elif language in SUPPORTED_LANGUAGES:
-        preference["language"] = language
-    if not preference:
-        users.pop(key, None)
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = SETTINGS_FILE.with_suffix(".json.tmp")
+def _write_settings(user_id: int, settings: dict[str, Any]) -> None:
+    path = _settings_file(user_id)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, SETTINGS_FILE)
+    os.replace(temporary, path)
+
+
+def set_user_language(user_id: int, language: str | None) -> None:
+    settings = _read_settings(user_id)
+    if language is None:
+        settings.pop("language", None)
+    elif language in SUPPORTED_LANGUAGES:
+        settings["language"] = language
+    _write_settings(user_id, settings)
 
 
 def get_user_search_threshold(user_id: int) -> int:
-    users = _read_settings().get("users", {})
-    preference = users.get(str(user_id), {}) if isinstance(users, dict) else {}
-    value = preference.get("search_threshold", 60) if isinstance(preference, dict) else 60
+    value = _read_settings(user_id).get("search_threshold", 60)
     if isinstance(value, bool) or not isinstance(value, int):
         return 60
     return max(0, min(100, (value // 5) * 5))
@@ -165,17 +177,9 @@ def get_user_search_threshold(user_id: int) -> int:
 
 def set_user_search_threshold(user_id: int, threshold: int) -> int:
     value = max(0, min(100, (int(threshold) // 5) * 5))
-    settings = _read_settings()
-    users = settings.setdefault("users", {})
-    preference = users.setdefault(str(user_id), {})
-    if not isinstance(preference, dict):
-        preference = {}
-        users[str(user_id)] = preference
-    preference["search_threshold"] = value
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = SETTINGS_FILE.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, SETTINGS_FILE)
+    settings = _read_settings(user_id)
+    settings["search_threshold"] = value
+    _write_settings(user_id, settings)
     return value
 
 
@@ -295,16 +299,16 @@ def remember_telegram_language(user_id: int, language_code: str | None) -> None:
 def language_for_chat(chat_id: int | str | None) -> str:
     if chat_id is None:
         return "en"
-    settings = _read_settings()
-    users = settings.get("users", {})
-    preference = users.get(str(chat_id), {}) if isinstance(users, dict) else {}
-    manual = preference.get("language") if isinstance(preference, dict) else None
-    if manual in SUPPORTED_LANGUAGES:
-        return manual
     try:
-        return _TELEGRAM_LANGUAGES.get(int(chat_id), "en")
+        user_id = int(chat_id)
     except (TypeError, ValueError):
         return "en"
+    if user_id <= 0:
+        return "en"
+    manual = _read_settings(user_id).get("language")
+    if manual in SUPPORTED_LANGUAGES:
+        return manual
+    return _TELEGRAM_LANGUAGES.get(user_id, "en")
 
 
 def localize_markup(markup: Any, language: str) -> Any:

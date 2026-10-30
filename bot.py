@@ -1,14 +1,17 @@
 import asyncio
+import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 import msvcrt
 import os
 import re
+import shutil
 import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from agents import Agent, RunConfig, Runner
 from pydantic import BaseModel, ConfigDict, Field
@@ -25,6 +28,7 @@ from telegram.ext import (
     filters,
 )
 
+from application_form import inspect_pracuj_application_form
 from bot_language import (
     AUTO_LANGUAGE_LABEL, BOT_COMMAND_DESCRIPTIONS, INFO_TEXT, LANGUAGE_AUTO_TEXT, LANGUAGE_NAMES, LANGUAGE_PROMPT,
     LANGUAGE_SET_TEXT, MENU_ACTIONS, MENU_LABELS, MENU_ROW_LAYOUT, PROFILE_ACTION_LABELS,
@@ -52,6 +56,7 @@ from career_features import (
     set_active_profile,
     toggle_selected_job,
     update_active_profile,
+    user_cv_dir,
 )
 
 _last_pracuj_detail_request_at = 0.0
@@ -98,14 +103,20 @@ def _install_localized_outputs() -> None:
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data" / "cv"
-PROFILE_DIR = BASE_DIR / "data" / "profile"
-PROFILE_FILE = PROFILE_DIR / "candidate_profile.json"
+LEGACY_CV_DIR = BASE_DIR / "data" / "cv"
+LEGACY_PROFILE_DIR = BASE_DIR / "data" / "profile"
+LEGACY_JOBS_DIR = BASE_DIR / "data" / "jobs"
+LEGACY_SETTINGS_FILE = BASE_DIR / "data" / "bot_settings.json"
+USERS_DIR = BASE_DIR / "data" / "users"
 MAX_CV_BYTES = 15 * 1024 * 1024
 MAX_EXTRACTED_CHARS = 80_000
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 LOGGER = logging.getLogger("wow_job_assistant")
 _INSTANCE_LOCK_HANDLE = None
+
+
+class CvTextLimitError(ValueError):
+    """Raised when extracted CV text exceeds the supported processing limit."""
 
 
 def acquire_instance_lock() -> None:
@@ -277,35 +288,137 @@ def owner_id() -> int | None:
     return int(value) if value.isdigit() else None
 
 
-def is_private_owner(update: Update) -> bool:
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _legacy_tree_has_files(source: Path) -> bool:
+    if not source.exists():
+        return False
+    return any(path.is_file() or path.is_symlink() for path in source.rglob("*"))
+
+
+def _copy_legacy_tree_verified(source: Path, destination: Path) -> None:
+    """Copy former shared user data, verifying each file and preserving the source."""
+    if not source.exists():
+        return
+    for current in [source, *source.rglob("*")]:
+        if current.is_symlink():
+            raise RuntimeError(f"Legacy data contains a symlink: {current.name}")
+    for source_file in (item for item in source.rglob("*") if item.is_file()):
+        target = destination / source_file.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if not target.is_file() or _file_digest(source_file) != _file_digest(target):
+                raise RuntimeError(f"Conflicting legacy data file: {source_file.name}")
+            continue
+        shutil.copy2(source_file, target)
+        if _file_digest(source_file) != _file_digest(target):
+            raise RuntimeError(f"Legacy data verification failed: {source_file.name}")
+
+
+def migrate_legacy_user_data() -> None:
+    """Copy data from the former owner-only layout into isolated Telegram user folders."""
+    legacy_trees = (
+        (LEGACY_CV_DIR, "cv"),
+        (LEGACY_PROFILE_DIR, "profile"),
+        (LEGACY_JOBS_DIR, "jobs"),
+    )
+    has_legacy_tree_data = any(_legacy_tree_has_files(path) for path, _ in legacy_trees)
+    has_legacy_settings = LEGACY_SETTINGS_FILE.is_file()
+    if not has_legacy_tree_data and not has_legacy_settings:
+        return
+
+    legacy_settings: dict[str, Any] = {}
+    if has_legacy_settings:
+        try:
+            parsed = json.loads(LEGACY_SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit("Nie udało się odczytać starych ustawień. Stare dane pozostawiono bez zmian; sprawdź data/bot_settings.json.") from exc
+        if not isinstance(parsed, dict):
+            raise SystemExit("Stary plik ustawień ma nieznany format. Dane pozostawiono bez zmian.")
+        legacy_settings = parsed
+
+    migration_owner = owner_id()
+    migration_marker = BASE_DIR / "data" / ".legacy-user-migration.json"
+    if migration_owner is None and migration_marker.is_file():
+        try:
+            marker = json.loads(migration_marker.read_text(encoding="utf-8"))
+            stored_owner = marker.get("owner_id") if isinstance(marker, dict) else None
+            migration_owner = int(stored_owner) if str(stored_owner).isdigit() and int(stored_owner) > 0 else None
+        except (OSError, json.JSONDecodeError, ValueError):
+            migration_owner = None
+    if has_legacy_tree_data and migration_owner is None:
+        raise SystemExit("Znaleziono starsze CV/profil/oferty bez przypisanego właściciela. Ustaw TELEGRAM_OWNER_ID w .env na identyfikator dotychczasowego właściciela, aby przypisać stare dane bezpiecznie.")
+
+    settings_by_user: dict[int, dict[str, Any]] = {}
+    old_users = legacy_settings.get("users")
+    if isinstance(old_users, dict):
+        for raw_user_id, settings in old_users.items():
+            if str(raw_user_id).isdigit() and int(raw_user_id) > 0 and isinstance(settings, dict):
+                settings_by_user[int(raw_user_id)] = settings
+    elif legacy_settings:
+        if migration_owner is None:
+            raise SystemExit("Stare ustawienia wymagają TELEGRAM_OWNER_ID do przypisania ich do właściwego użytkownika. Plik pozostawiono bez zmian.")
+        settings_by_user[migration_owner] = legacy_settings
+
+    try:
+        for source, subdirectory in legacy_trees:
+            if _legacy_tree_has_files(source):
+                _copy_legacy_tree_verified(source, USERS_DIR / str(migration_owner) / subdirectory)
+        for user_id, settings in settings_by_user.items():
+            target = USERS_DIR / str(user_id) / "settings.json"
+            existing: dict[str, Any] = {}
+            if target.is_file():
+                current = json.loads(target.read_text(encoding="utf-8"))
+                if not isinstance(current, dict):
+                    raise RuntimeError(f"Nieznany format ustawień użytkownika {user_id}.")
+                existing = current
+            if any(existing[key] != settings[key] for key in existing.keys() & settings.keys()):
+                raise RuntimeError(f"Konflikt ustawień użytkownika {user_id}; zachowano oba źródła.")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_suffix(".json.migration.tmp")
+            temporary.write_text(json.dumps({**settings, **existing}, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, target)
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Migracja została zatrzymana. Źródłowe dane pozostawiono bez zmian: {exc}") from exc
+    if migration_owner is not None:
+        migration_marker.parent.mkdir(parents=True, exist_ok=True)
+        migration_marker.write_text(json.dumps({"owner_id": migration_owner}, indent=2), encoding="utf-8")
+    LOGGER.warning("Stare wspólne dane skopiowano i zweryfikowano. Oryginały w data/cv, data/profile, data/jobs i data/bot_settings.json pozostawiono jako kopię; usuń je dopiero po sprawdzeniu migracji i wykonaniu własnej kopii zapasowej.")
+
+
+def is_private_chat_user(update: Update) -> bool:
     user = update.effective_user
     chat = update.effective_chat
-    allowed_id = owner_id()
     return bool(
         user
         and chat
         and chat.type == ChatType.PRIVATE
-        and allowed_id is not None
-        and user.id == allowed_id
     )
 
 
-def validate_cv_path(raw_path: str | None) -> Path | None:
+def validate_cv_path(user_id: int, raw_path: str | None) -> Path | None:
     if not raw_path:
         return None
     path = Path(raw_path).resolve()
-    if path.parent != DATA_DIR.resolve() or path.suffix.lower() not in ALLOWED_EXTENSIONS:
+    if Path(raw_path).name != path.name or path.parent != user_cv_dir(user_id).resolve() or path.suffix.lower() not in ALLOWED_EXTENSIONS:
         return None
     if not path.is_file() or path.stat().st_size > MAX_CV_BYTES:
         return None
     return path
 
 
-def latest_cv() -> Path | None:
-    if not DATA_DIR.is_dir():
+def latest_cv(user_id: int) -> Path | None:
+    cv_dir = user_cv_dir(user_id)
+    if not cv_dir.is_dir():
         return None
     candidates = [
-        path for path in DATA_DIR.iterdir()
+        path for path in cv_dir.iterdir()
         if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS
     ]
     return max(candidates, key=lambda path: path.stat().st_mtime, default=None)
@@ -323,15 +436,9 @@ def ask_for_cv_consent(path: Path, context: ContextTypes.DEFAULT_TYPE) -> Inline
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message:
+    if not message or not is_private_chat_user(update):
         return
     language = _ui_language(update)
-    if owner_id() is None:
-        await message.reply_text(translate_ui_text("Dostęp nie jest skonfigurowany. Wyślij /id, wpisz wynik jako TELEGRAM_OWNER_ID w lokalnym .env i uruchom bota ponownie.", language))
-        return
-    if not is_private_owner(update):
-        await message.reply_text(translate_ui_text("Ten bot jest prywatny.", language))
-        return
     await context.bot.set_my_commands([BotCommand(command, description) for command, description in commands_for_language(language)], scope=BotCommandScopeChat(chat_id=update.effective_chat.id))
     text = START_TEXT.get(language, START_TEXT["en"])
     await message.reply_text(text, reply_markup=main_menu_keyboard(language))
@@ -339,7 +446,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
+    if not message or not is_private_chat_user(update):
         return
     language = _ui_language(update)
     await context.bot.set_my_commands([BotCommand(command, description) for command, description in commands_for_language(language)], scope=BotCommandScopeChat(chat_id=update.effective_chat.id))
@@ -356,7 +463,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def menu_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
+    if not message or not is_private_chat_user(update):
         return
     language = _ui_language(update)
     label = (message.text or "").strip()
@@ -427,9 +534,9 @@ async def receive_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     document = message.document if message else None
     if not message or not document:
         return
-    if not is_private_owner(update):
-        await message.reply_text("Ten bot jest prywatny.")
+    if not is_private_chat_user(update):
         return
+    user_id = update.effective_user.id
 
     suffix = Path(document.file_name or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -440,9 +547,10 @@ async def receive_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     await message.reply_text(translate_ui_text("Odebrałem CV. Pobieram plik z Telegrama i zapisuję go lokalnie…", _ui_language(update)))
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cv_dir = user_cv_dir(user_id)
+    cv_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    destination = DATA_DIR / f"cv_{timestamp}{suffix}"
+    destination = cv_dir / f"cv_{timestamp}{suffix}"
     try:
         telegram_file = await context.bot.get_file(document.file_id)
         await telegram_file.download_to_drive(custom_path=destination)
@@ -463,12 +571,9 @@ async def receive_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message:
+    if not message or not is_private_chat_user(update):
         return
-    if not is_private_owner(update):
-        await message.reply_text("Ten bot jest prywatny.")
-        return
-    path = latest_cv()
+    path = latest_cv(update.effective_user.id)
     if not path:
         await message.reply_text("Nie mam zapisanego CV. Prześlij plik PDF, DOCX lub TXT.")
         return
@@ -717,8 +822,8 @@ def profile_category_summary(profile: CandidateProfile, language: str) -> str:
     return "\n".join(lines)
 
 
-def _active_profile() -> tuple[str, dict[str, object], CandidateProfile] | None:
-    record = get_profile_record()
+def _active_profile(user_id: int) -> tuple[str, dict[str, object], CandidateProfile] | None:
+    record = get_profile_record(user_id)
     if not record:
         return None
     try:
@@ -742,16 +847,15 @@ def _profile_actions() -> InlineKeyboardMarkup:
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
-        if message:
-            await message.reply_text(translate_ui_text("Ten bot jest prywatny.", _ui_language(update)))
+    if not message or not is_private_chat_user(update):
         return
     language = _ui_language(update)
-    record = profile_registry()
+    user_id = update.effective_user.id
+    record = profile_registry(user_id)
     active_id = record.get("active_profile_id")
-    active = get_profile_record(active_id) if active_id else None
+    active = get_profile_record(user_id, active_id) if active_id else None
     if not active:
-        cv_records = list_profiles()
+        cv_records = list_profiles(user_id)
         text = "Nie ma jeszcze zapisanego profilu. Możesz zarządzać zapisanymi CV lub wysłać nowe CV."
         if cv_records:
             text += "\n\n" + translate_ui_text("Zapisane CV. Wybierz profil do aktywacji lub CV do analizy.", language)
@@ -763,15 +867,16 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _send_split(message, profile_preview(profile, language), profile_menu_keyboard(language))
 
 
-def list_local_cv_files() -> list[Path]:
-    if not DATA_DIR.is_dir():
+def list_local_cv_files(user_id: int) -> list[Path]:
+    cv_dir = user_cv_dir(user_id)
+    if not cv_dir.is_dir():
         return []
-    return sorted((path for path in DATA_DIR.iterdir() if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS), key=lambda path: path.stat().st_mtime, reverse=True)
+    return sorted((path for path in cv_dir.iterdir() if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS), key=lambda path: path.stat().st_mtime, reverse=True)
 
 
-def _cv_list_keyboard(language: str) -> InlineKeyboardMarkup:
+def _cv_list_keyboard(language: str, user_id: int) -> InlineKeyboardMarkup:
     rows = []
-    for path in list_local_cv_files():
+    for path in list_local_cv_files(user_id):
         rows.append([InlineKeyboardButton(path.name[:60], callback_data=f"cv:select:{path.name}")])
     rows.append([InlineKeyboardButton(translate_ui_text("🔙 Wróć do profilu", language), callback_data="profile:back")])
     return InlineKeyboardMarkup(rows)
@@ -785,10 +890,10 @@ def _selected_cv_keyboard(path: Path, language: str) -> InlineKeyboardMarkup:
     ])
 
 
-def _candidate_profiles_keyboard(language: str) -> InlineKeyboardMarkup:
-    active_id = profile_registry().get("active_profile_id")
+def _candidate_profiles_keyboard(language: str, user_id: int) -> InlineKeyboardMarkup:
+    active_id = profile_registry(user_id).get("active_profile_id")
     rows = []
-    for profile_id, record in list_profiles():
+    for profile_id, record in list_profiles(user_id):
         name = str(record.get("source_cv") or profile_id)
         marker = "★ " if profile_id == active_id else ""
         rows.append([InlineKeyboardButton(f"{marker}{name}"[:60], callback_data=f"profile:select:{profile_id}")])
@@ -798,22 +903,23 @@ def _candidate_profiles_keyboard(language: str) -> InlineKeyboardMarkup:
 
 async def candidate_profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
+    if not message or not is_private_chat_user(update):
         return
     language = _ui_language(update)
-    if not list_profiles():
+    user_id = update.effective_user.id
+    if not list_profiles(user_id):
         await message.reply_text(translate_ui_text("Nie ma jeszcze zapisanych profili kandydata.", language), reply_markup=profile_menu_keyboard(language))
         return
     await message.reply_text(
         translate_ui_text("Profile kandydatów. Wybierz profil do zarządzania:", language),
-        reply_markup=_candidate_profiles_keyboard(language),
+        reply_markup=_candidate_profiles_keyboard(language, user_id),
     )
 
 
-async def show_selected_profile(query, profile_id: str, language: str) -> None:
-    record = get_profile_record(profile_id)
+async def show_selected_profile(query, profile_id: str, language: str, user_id: int) -> None:
+    record = get_profile_record(user_id, profile_id)
     if not record:
-        await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language), reply_markup=_candidate_profiles_keyboard(language))
+        await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language), reply_markup=_candidate_profiles_keyboard(language, user_id))
         return
     name = str(record[1].get("source_cv") or profile_id)
     keyboard = InlineKeyboardMarkup([
@@ -829,34 +935,33 @@ async def show_selected_profile(query, profile_id: str, language: str) -> None:
 
 async def cvs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
-        if message:
-            await message.reply_text(translate_ui_text("Ten bot jest prywatny.", _ui_language(update)))
+    if not message or not is_private_chat_user(update):
         return
     language = _ui_language(update)
-    files = list_local_cv_files()
+    user_id = update.effective_user.id
+    files = list_local_cv_files(user_id)
     if not files:
         await message.reply_text(
             translate_ui_text("Nie ma lokalnie zapisanych plików CV. Wyślij CV w tym czacie, aby je dodać.", language),
-            reply_markup=_cv_list_keyboard(language),
+            reply_markup=_cv_list_keyboard(language, user_id),
         )
         return
     await message.reply_text(
         translate_ui_text("Twoje lokalne CV. Wybierz plik:", language),
-        reply_markup=_cv_list_keyboard(language),
+        reply_markup=_cv_list_keyboard(language, user_id),
     )
 
 
-async def confirm_delete_cv(query, filename: str, language: str) -> None:
-    path = validate_cv_path(str(DATA_DIR / filename))
+async def confirm_delete_cv(query, filename: str, language: str, user_id: int) -> None:
+    path = validate_cv_path(user_id, str(user_cv_dir(user_id) / filename))
     if not path:
-        await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language))
+        await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language, user_id))
         return
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(translate_ui_text("Potwierdź usunięcie CV", language), callback_data=f"cv:delete:{path.name}")],
         [InlineKeyboardButton(translate_ui_text("Anuluj", language), callback_data=f"cv:delete_cancel:{path.name}")],
     ])
-    linked = any(str(record.get("source_cv") or "") == path.name for _, record in list_profiles())
+    linked = any(str(record.get("source_cv") or "") == path.name for _, record in list_profiles(user_id))
     text = format_ui("delete_cv_confirm", language, filename=path.name)
     if linked:
         text += " " + translate_ui_text("Profil powiązany pozostanie zapisany, ale nie będzie można ponownie odczytać jego źródłowego CV.", language)
@@ -865,18 +970,16 @@ async def confirm_delete_cv(query, filename: str, language: str) -> None:
 
 async def use_cv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
-        if message:
-            await message.reply_text("Ten bot jest prywatny.")
+    if not message or not is_private_chat_user(update):
         return
-    if context.args and set_active_profile(context.args[0]):
+    if context.args and set_active_profile(update.effective_user.id, context.args[0]):
         await message.reply_text(format_ui("active_profile_changed", _ui_language(update), id=context.args[0]))
         return
     await cvs_command(update, context)
 
 
-async def _begin_profile_supplement(target, context: ContextTypes.DEFAULT_TYPE, profile_id: str, language: str) -> None:
-    record = get_profile_record(profile_id)
+async def _begin_profile_supplement(target, context: ContextTypes.DEFAULT_TYPE, profile_id: str, language: str, user_id: int) -> None:
+    record = get_profile_record(user_id, profile_id)
     if not record:
         error_text = translate_ui_text("Nie znaleziono tego profilu.", language)
         if isinstance(target, CallbackQuery):
@@ -912,24 +1015,20 @@ async def _begin_profile_supplement(target, context: ContextTypes.DEFAULT_TYPE, 
 
 async def complete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
-        if message:
-            await message.reply_text(translate_ui_text("Ten bot jest prywatny.", _ui_language(update)))
+    if not message or not is_private_chat_user(update):
         return
-    active = _active_profile()
+    active = _active_profile(update.effective_user.id)
     if not active:
         await message.reply_text(translate_ui_text("Najpierw zapisz profil poleceniem /analyze.", _ui_language(update)))
         return
-    await _begin_profile_supplement(message, context, active[0], _ui_language(update))
+    await _begin_profile_supplement(message, context, active[0], _ui_language(update), update.effective_user.id)
 
 
 async def delete_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
-        if message:
-            await message.reply_text("Ten bot jest prywatny.")
+    if not message or not is_private_chat_user(update):
         return
-    active = _active_profile()
+    active = _active_profile(update.effective_user.id)
     if not active:
         await message.reply_text("Nie ma aktywnego profilu do usunięcia.")
         return
@@ -940,7 +1039,7 @@ async def delete_profile_command(update: Update, context: ContextTypes.DEFAULT_T
     await message.reply_text("Usunę zapisany profil kandydata. Oryginalny plik CV pozostanie lokalnie i będzie można ponownie go przeanalizować. Potwierdzasz?", reply_markup=keyboard)
 
 
-async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int, language: str | None = None) -> None:
+async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int, user_id: int, language: str | None = None) -> None:
     global _last_pracuj_detail_request_at
     language = normalize_language(language or _ui_language_from_message(message))
     page_size = 8
@@ -952,7 +1051,7 @@ async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int,
     if not visible:
         await message.reply_text("Nie ma już ofert na tej stronie wyników.")
         return
-    chosen = selected_jobs().get("jobs", {})
+    chosen = selected_jobs(user_id).get("jobs", {})
     for row in visible:
         offer, fit = row["offer"], row["fit"]
         if not isinstance(offer, dict) or not isinstance(fit, dict):
@@ -965,7 +1064,7 @@ async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int,
                 detailed = await asyncio.to_thread(enrich_pracuj_offer, JobOffer.model_validate(offer))
                 offer.update(detailed.model_dump(mode="json"))
                 row["offer"] = offer
-                save_search_results(ranked)
+                save_search_results(user_id, ranked)
             except Exception as exc:
                 LOGGER.warning("Pracuj offer detail enrichment failed (%s).", type(exc).__name__)
             _last_pracuj_detail_request_at = time.monotonic()
@@ -1074,7 +1173,7 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
                 _ACTIVE_JOB_SEARCH_STATUSES.pop(owner, None),
             ) if _ACTIVE_JOB_SEARCHES.get(owner) is completed else None
         )
-    active = _active_profile()
+    active = _active_profile(user_id)
     if not active:
         _ACTIVE_JOB_SEARCHES.pop(user_id, None)
         await message.reply_text("Najpierw zapisz aktywny profil poleceniem /analyze.")
@@ -1108,7 +1207,7 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
     try:
         await status.edit_text(translate_ui_text("Dopasowuję nazwy stanowisk i miast do zapisu używanego przez Pracuj.pl…", language))
         related_titles, normalized_locations = await expand_job_search_inputs(
-            profile.model_dump(mode="json"), language, locations_to_normalize,
+            user_id, profile.model_dump(mode="json"), language, locations_to_normalize,
             portal_locale="pl-PL", portal_country="Poland",
         )
         terms = _job_search_terms(profile, query, related_titles)
@@ -1116,7 +1215,7 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
             normalized_iter = iter(normalized_locations)
             locations = [next(normalized_iter) if value else None for value in locations]
     except Exception as exc:
-        LOGGER.exception("Rozszerzenie nazw stanowisk nie powiodło się; używam nazw z profilu (%s).", type(exc).__name__)
+        LOGGER.error("Rozszerzenie nazw stanowisk nie powiodło się; używam nazw z profilu (%s).", type(exc).__name__)
     if len(terms) > 6:
         LOGGER.info("Limiting Pracuj.pl search to 6 of %d related title queries.", len(terms))
         terms = terms[:6]
@@ -1140,9 +1239,9 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
                     except RuntimeError as exc:
                         last_portal_request_at = time.monotonic()
                         if portal_page == 1:
-                            LOGGER.warning("Pracuj.pl search request failed (term=%d/%d page=%d location=%s): %s", term_index, len(terms), portal_page, search_location or "all", str(exc))
+                            LOGGER.warning("Pracuj.pl search request failed (term=%d/%d page=%d error=%s).", term_index, len(terms), portal_page, type(exc).__name__)
                         elif "HTTP 404" not in str(exc):
-                            LOGGER.warning("Pracuj.pl pagination stopped after %d pages (term=%d/%d location=%s): %s", portal_page - 1, term_index, len(terms), search_location or "all", str(exc))
+                            LOGGER.warning("Pracuj.pl pagination stopped after %d pages (term=%d/%d error=%s).", portal_page - 1, term_index, len(terms), type(exc).__name__)
                         if "HTTP 429" in str(exc):
                             rate_limited = True
                         break
@@ -1168,7 +1267,7 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
 
         offers = list(offers_by_id.values())
         if not offers:
-            save_search_results([])
+            save_search_results(user_id, [])
             if rate_limited:
                 await status.edit_text(translate_ui_text("Pracuj.pl ograniczył liczbę żądań. Poczekaj chwilę przed kolejnym wyszukiwaniem.", language))
             else:
@@ -1178,34 +1277,32 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
         batches = _job_assessment_batches(profile, offers)
         for batch_index, batch in enumerate(batches, start=1):
             await status.edit_text(format_ui("search_batch", language, count=len(offers), pages=pages_scanned, index=batch_index, total=len(batches)))
-            all_ranked.extend(await rank_jobs(profile.model_dump(mode="json"), batch, language))
+            all_ranked.extend(await rank_jobs(user_id, profile.model_dump(mode="json"), batch, language))
         threshold = get_user_search_threshold(user_id)
         all_ranked = [row for row in all_ranked if int(row.get("fit", {}).get("score", 0)) >= threshold]
         all_ranked.sort(key=lambda row: int(row.get("fit", {}).get("score", 0)), reverse=True)
     except Exception as exc:
-        LOGGER.exception("Wyszukiwanie ofert nie powiodło się (%s).", type(exc).__name__)
+        LOGGER.error("Wyszukiwanie ofert nie powiodło się (%s).", type(exc).__name__)
         await status.edit_text(translate_ui_text("Nie udało się pobrać lub ocenić ofert. Sprawdź połączenie i spróbuj ponownie.", language))
         return
     context.user_data["job_query"] = query
     context.user_data["job_location"] = location
     context.user_data["job_page"] = 1
-    save_search_results(all_ranked)
+    save_search_results(user_id, all_ranked)
     elapsed = time.monotonic() - search_started
     LOGGER.info("Pracuj search completed: terms=%d pages=%d offers=%d qualified=%d elapsed_seconds=%.2f", len(terms), pages_scanned, len(offers), len(all_ranked), elapsed)
     completion_text = format_ui("search_finished", language, pages=pages_scanned, count=len(offers), qualified=len(all_ranked), seconds=elapsed)
     if rate_limited:
         completion_text += "\n\n" + translate_ui_text("Pracuj.pl ograniczył liczbę żądań. Pokazuję dotychczas zebrane oferty; spróbuj ponownie później.", language)
     await status.edit_text(completion_text)
-    await _send_ranked_jobs(message, all_ranked, 1, language)
+    await _send_ranked_jobs(message, all_ranked, 1, user_id, language)
 
 
 async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
-        if message:
-            await message.reply_text("Ten bot jest prywatny.")
+    if not message or not is_private_chat_user(update):
         return
-    active = _active_profile()
+    active = _active_profile(update.effective_user.id)
     if not active:
         await message.reply_text("Najpierw zapisz aktywny profil poleceniem /analyze.")
         return
@@ -1228,11 +1325,9 @@ async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def selected_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
-        if message:
-            await message.reply_text("Ten bot jest prywatny.")
+    if not message or not is_private_chat_user(update):
         return
-    jobs = selected_jobs().get("jobs", {})
+    jobs = selected_jobs(update.effective_user.id).get("jobs", {})
     if not jobs:
         await message.reply_text("Nie wybrano jeszcze ofert. Użyj /jobs, aby wyszukać i zaznaczyć oferty.")
         return
@@ -1248,12 +1343,10 @@ async def selected_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def apply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
-        if message:
-            await message.reply_text("Ten bot jest prywatny.")
+    if not message or not is_private_chat_user(update):
         return
-    jobs = selected_jobs().get("jobs", {})
-    active = _active_profile()
+    jobs = selected_jobs(update.effective_user.id).get("jobs", {})
+    active = _active_profile(update.effective_user.id)
     if not active:
         await message.reply_text("Najpierw zapisz aktywny profil poleceniem /analyze.")
         return
@@ -1304,14 +1397,14 @@ async def apply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def free_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not is_private_owner(update):
+    if not message or not is_private_chat_user(update):
         return
     flow = context.user_data.get("flow")
     if flow == "profile_supplement":
         profile_id = context.user_data.get("profile_supplement_target_id")
         steps = context.user_data.get("profile_supplement_steps") or []
         working = context.user_data.get("profile_supplement_working")
-        target = get_profile_record(profile_id) if profile_id else None
+        target = get_profile_record(update.effective_user.id, profile_id) if profile_id else None
         if not target or not isinstance(working, dict) or not steps:
             context.user_data.pop("flow", None)
             context.user_data.pop("profile_supplement_target_id", None)
@@ -1375,12 +1468,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
     except TimedOut:
         LOGGER.warning("Telegram callback acknowledgement timed out; continuing with the requested action.")
-    if not is_private_owner(update):
-        await query.edit_message_text(translate_ui_text("Ten bot jest prywatny.", _ui_language(update)))
+    if not is_private_chat_user(update):
         return
 
     data = query.data or ""
     language = _ui_language(update)
+    user_id = update.effective_user.id
     if data.startswith("search_settings:"):
         user = update.effective_user
         if not user:
@@ -1410,38 +1503,38 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if data.startswith("cv:active:"):
         profile_id = data.split(":", 2)[2]
-        await show_selected_profile(query, profile_id, language)
+        await show_selected_profile(query, profile_id, language, user_id)
         return
     if data == "profile:add":
-        active = _active_profile()
+        active = _active_profile(user_id)
         if active:
-            await _begin_profile_supplement(query, context, active[0], language)
+            await _begin_profile_supplement(query, context, active[0], language, user_id)
         else:
             await query.message.reply_text(translate_ui_text("Nie ma aktywnego profilu.", language))
         return
     if data.startswith("profile:complete:"):
-        await _begin_profile_supplement(query, context, data.split(":", 2)[2], language)
+        await _begin_profile_supplement(query, context, data.split(":", 2)[2], language, user_id)
         return
     if data == "profile:list":
-        if not list_profiles():
+        if not list_profiles(user_id):
             await query.edit_message_text(translate_ui_text("Nie ma jeszcze zapisanych profili kandydata.", language), reply_markup=profile_menu_keyboard(language))
         else:
-            await query.edit_message_text(translate_ui_text("Profile kandydatów. Wybierz profil do zarządzania:", language), reply_markup=_candidate_profiles_keyboard(language))
+            await query.edit_message_text(translate_ui_text("Profile kandydatów. Wybierz profil do zarządzania:", language), reply_markup=_candidate_profiles_keyboard(language, user_id))
         return
     if data.startswith("profile:select:"):
-        await show_selected_profile(query, data.split(":", 2)[2], language)
+        await show_selected_profile(query, data.split(":", 2)[2], language, user_id)
         return
     if data.startswith("profile:use:"):
         profile_id = data.split(":", 2)[2]
-        if set_active_profile(profile_id):
+        if set_active_profile(user_id, profile_id):
             await query.edit_message_text(format_ui("active_profile_changed", language, id=profile_id))
         else:
             await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language))
         return
     if data.startswith("profile:delete_confirm:"):
         profile_id = data.split(":", 2)[2]
-        if not get_profile_record(profile_id):
-            await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language), reply_markup=_candidate_profiles_keyboard(language))
+        if not get_profile_record(user_id, profile_id):
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language), reply_markup=_candidate_profiles_keyboard(language, user_id))
             return
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(translate_ui_text("Potwierdź usunięcie profilu", language), callback_data=f"profile:delete:{profile_id}")],
@@ -1458,13 +1551,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if data == "profile_supplement:approve":
         draft = context.user_data.pop("profile_supplement_draft", None)
-        if not draft or not update_active_profile(draft["profile_id"], draft["profile"]):
+        if not draft or not update_active_profile(user_id, draft["profile_id"], draft["profile"]):
             await query.edit_message_text(translate_ui_text("Nie udało się zapisać uzupełnienia. Profil mógł zostać usunięty.", language))
             return
         await query.edit_message_text(translate_ui_text("Uzupełniony profil zapisano lokalnie w języku oryginalnego CV.", language))
         return
     if data == "profile:delete_confirm":
-        active = _active_profile()
+        active = _active_profile(user_id)
         if not active:
             await query.edit_message_text(translate_ui_text("Nie ma aktywnego profilu.", language))
             return
@@ -1475,19 +1568,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if data.startswith("profile:delete:"):
         profile_id = data.split(":", 2)[2]
-        selected_record = get_profile_record(profile_id)
+        selected_record = get_profile_record(user_id, profile_id)
         if not selected_record:
-            await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language), reply_markup=_candidate_profiles_keyboard(language))
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego profilu.", language), reply_markup=_candidate_profiles_keyboard(language, user_id))
             return
-        was_active = profile_registry().get("active_profile_id") == profile_id
-        replacement = delete_profile_record(profile_id)
+        was_active = profile_registry(user_id).get("active_profile_id") == profile_id
+        replacement = delete_profile_record(user_id, profile_id)
         if was_active:
             key = "deleted_profile_with_replacement" if replacement else "deleted_profile_no_replacement"
             result = format_ui(key, language, id=replacement or "")
         else:
             result = translate_ui_text("Profil kandydata został usunięty.", language)
-        remaining = list_profiles()
-        await query.edit_message_text(result, reply_markup=_candidate_profiles_keyboard(language) if remaining else None)
+        remaining = list_profiles(user_id)
+        await query.edit_message_text(result, reply_markup=_candidate_profiles_keyboard(language, user_id) if remaining else None)
         return
     if data == "profile:delete_cancel":
         await query.edit_message_text(translate_ui_text("Anulowano. Profil pozostał zapisany.", language))
@@ -1498,21 +1591,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.reply_text(translate_ui_text("Otwieram profil użytkownika.", language), reply_markup=profile_menu_keyboard(language))
         return
     if data == "cv:list":
-        files = list_local_cv_files()
+        files = list_local_cv_files(user_id)
         title = "Twoje lokalne CV. Wybierz plik:" if files else "Nie ma lokalnie zapisanych plików CV. Wyślij CV w tym czacie, aby je dodać."
-        await query.edit_message_text(translate_ui_text(title, language), reply_markup=_cv_list_keyboard(language))
+        await query.edit_message_text(translate_ui_text(title, language), reply_markup=_cv_list_keyboard(language, user_id))
         return
     if data.startswith("cv:select:"):
-        path = validate_cv_path(str(DATA_DIR / data.split(":", 2)[2]))
+        filename = data.split(":", 2)[2]
+        path = validate_cv_path(user_id, str(user_cv_dir(user_id) / filename))
         if not path:
-            await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language))
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language, user_id))
             return
         await query.edit_message_text(format_ui("selected_cv", language, filename=path.name), reply_markup=_selected_cv_keyboard(path, language))
         return
     if data.startswith("cv:analyze:"):
-        path = validate_cv_path(str(DATA_DIR / data.split(":", 2)[2]))
+        filename = data.split(":", 2)[2]
+        path = validate_cv_path(user_id, str(user_cv_dir(user_id) / filename))
         if not path:
-            await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language))
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language, user_id))
             return
         keyboard = ask_for_cv_consent(path, context)
         await query.edit_message_text(
@@ -1521,26 +1616,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     if data.startswith("cv:delete_confirm:"):
-        await confirm_delete_cv(query, data.split(":", 2)[2], language)
+        await confirm_delete_cv(query, data.split(":", 2)[2], language, user_id)
         return
     if data.startswith("cv:delete_cancel:"):
         filename = data.split(":", 2)[2]
-        path = validate_cv_path(str(DATA_DIR / filename))
+        path = validate_cv_path(user_id, str(user_cv_dir(user_id) / filename))
         if path:
             await query.edit_message_text(format_ui("selected_cv", language, filename=path.name), reply_markup=_selected_cv_keyboard(path, language))
         else:
-            await query.edit_message_text(translate_ui_text("Anulowano usuwanie CV. Plik pozostał zapisany.", language), reply_markup=_cv_list_keyboard(language))
+            await query.edit_message_text(translate_ui_text("Anulowano usuwanie CV. Plik pozostał zapisany.", language), reply_markup=_cv_list_keyboard(language, user_id))
         return
     if data == "cv:delete_cancel":
-        await query.edit_message_text(translate_ui_text("Anulowano usuwanie CV. Plik pozostał zapisany.", language), reply_markup=_cv_list_keyboard(language))
+        await query.edit_message_text(translate_ui_text("Anulowano usuwanie CV. Plik pozostał zapisany.", language), reply_markup=_cv_list_keyboard(language, user_id))
         return
     if data.startswith("cv:delete:"):
-        path = validate_cv_path(str(DATA_DIR / data.split(":", 2)[2]))
+        filename = data.split(":", 2)[2]
+        path = validate_cv_path(user_id, str(user_cv_dir(user_id) / filename))
         if not path:
-            await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language))
+            await query.edit_message_text(translate_ui_text("Nie znaleziono tego lokalnego CV.", language), reply_markup=_cv_list_keyboard(language, user_id))
             return
         filename = path.name
-        linked = any(str(record.get("source_cv") or "") == filename for _, record in list_profiles())
+        linked = any(str(record.get("source_cv") or "") == filename for _, record in list_profiles(user_id))
         try:
             path.unlink()
         except OSError:
@@ -1549,28 +1645,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         confirmation_key = "deleted_cv_linked" if linked else "deleted_cv_plain"
         confirmation = format_ui(confirmation_key, language, filename=filename)
         try:
-            await query.edit_message_text(confirmation, reply_markup=_cv_list_keyboard(language))
+            await query.edit_message_text(confirmation, reply_markup=_cv_list_keyboard(language, user_id))
         except TimedOut:
             LOGGER.warning("CV file deleted locally, but Telegram timed out before confirming the deletion.")
         return
     if data.startswith("job:add:") or data.startswith("job:remove:"):
         _, action, job_id = data.split(":", 2)
-        current = next((item for item in get_search_results() if item.get("offer", {}).get("id") == job_id), None)
+        current = next((item for item in get_search_results(user_id) if item.get("offer", {}).get("id") == job_id), None)
         if action == "add" and current:
-            toggle_selected_job(current["offer"], current.get("fit"))
+            toggle_selected_job(user_id, current["offer"], current.get("fit"))
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Usuń z wybranych", callback_data=f"job:remove:{job_id}")]])
             await query.edit_message_reply_markup(reply_markup=localize_markup(keyboard, language))
             await query.message.reply_text("Oferta została dodana do wybranych. Zobacz listę przez /selected.")
         else:
-            toggle_selected_job({"id": job_id})
+            toggle_selected_job(user_id, {"id": job_id})
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Wybieram tę ofertę", callback_data=f"job:add:{job_id}")]])
             await query.edit_message_reply_markup(reply_markup=localize_markup(keyboard, language))
             await query.message.reply_text("Usunięto ofertę z wybranych.")
         return
     if data.startswith("job:page:"):
         page = int(data.rsplit(":", 1)[1])
-        ranked = get_search_results()
-        await _send_ranked_jobs(query.message, ranked, page, language)
+        ranked = get_search_results(user_id)
+        await _send_ranked_jobs(query.message, ranked, page, user_id, language)
         return
 
 
@@ -1605,7 +1701,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if query.data == "cv_consent:send":
-        path = validate_cv_path(context.user_data.get("pending_cv_path"))
+        path = validate_cv_path(user_id, context.user_data.get("pending_cv_path"))
         if not path:
             await query.edit_message_text("Nie mogę znaleźć tego CV. Wyślij plik ponownie.")
             return
@@ -1665,8 +1761,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
         profile = CandidateProfile.model_validate(raw_profile)
-        source_path = validate_cv_path(context.user_data.get("profile_draft_source"))
-        profile_id = save_approved_profile(profile.model_dump(mode="json"), source_path.name if source_path else None)
+        source_path = validate_cv_path(user_id, context.user_data.get("profile_draft_source"))
+        profile_id = save_approved_profile(user_id, profile.model_dump(mode="json"), source_path.name if source_path else None)
         context.user_data.pop("profile_draft", None)
         context.user_data.pop("profile_draft_source", None)
         await query.edit_message_text(
@@ -1681,6 +1777,8 @@ async def post_init(application: Application) -> None:
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     message = update.effective_message
+    if not is_private_chat_user(update):
+        return
     user_id = user.id if user else None
     active_task = _ACTIVE_JOB_SEARCHES.get(user_id) if user_id is not None else None
     if active_task and not active_task.done() and active_task is not asyncio.current_task():
@@ -1734,8 +1832,7 @@ def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Brak TELEGRAM_BOT_TOKEN. Uzupełnij token lokalnie w pliku .env.")
-    if owner_id() is None:
-        LOGGER.warning("TELEGRAM_OWNER_ID nie jest skonfigurowany.")
+    migrate_legacy_user_data()
 
     application = ApplicationBuilder().token(token).post_init(post_init).concurrent_updates(4).build()
     application.add_handler(CommandHandler("start", start))
