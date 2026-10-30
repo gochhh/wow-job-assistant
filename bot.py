@@ -4,6 +4,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import msvcrt
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,7 +40,7 @@ from career_features import (
     list_profiles,
     profile_registry,
     rank_jobs,
-    suggest_related_job_titles,
+    expand_job_search_inputs,
     save_approved_profile,
     save_search_results,
     selected_jobs,
@@ -974,14 +975,6 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
     status = await message.reply_text(translate_ui_text("Rozpoczynam wyszukiwanie ofert na Pracuj.pl. Sprawdzę kolejne strony i zbliżone nazwy stanowisk.", language))
     search_started = time.monotonic()
     terms = _job_search_terms(profile, query)
-    try:
-        await status.edit_text(translate_ui_text("Analizuję udokumentowane obowiązki i kompetencje, aby dobrać zbliżone nazwy stanowisk…", _ui_language_from_message(message)))
-        related_titles = await suggest_related_job_titles(profile.model_dump(mode="json"), _ui_language_from_message(message))
-        terms = _job_search_terms(profile, query, related_titles)
-    except Exception as exc:
-        LOGGER.exception("Rozszerzenie nazw stanowisk nie powiodło się; używam nazw z profilu (%s).", type(exc).__name__)
-    offers_by_id: dict[str, object] = {}
-    pages_scanned = 0
     preferred_mode = (profile.preferred_work_mode or "").casefold()
     if not preferred_mode:
         preferences = " ".join(profile.work_preferences).casefold()
@@ -1001,6 +994,26 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
         locations = [profile.location_city_country.split(",", 1)[0].strip()]
     else:
         locations = [None]
+    locations_to_normalize = [value for value in locations if value]
+    try:
+        await status.edit_text(translate_ui_text("Dopasowuję nazwy stanowisk i miast do zapisu używanego przez Pracuj.pl…", language))
+        related_titles, normalized_locations = await expand_job_search_inputs(
+            profile.model_dump(mode="json"), language, locations_to_normalize,
+            portal_locale="pl-PL", portal_country="Poland",
+        )
+        terms = _job_search_terms(profile, query, related_titles)
+        if len(normalized_locations) == len(locations_to_normalize):
+            normalized_iter = iter(normalized_locations)
+            locations = [next(normalized_iter) if value else None for value in locations]
+    except Exception as exc:
+        LOGGER.exception("Rozszerzenie nazw stanowisk nie powiodło się; używam nazw z profilu (%s).", type(exc).__name__)
+    if len(terms) > 6:
+        LOGGER.info("Limiting Pracuj.pl search to 6 of %d related title queries.", len(terms))
+        terms = terms[:6]
+    offers_by_id: dict[str, object] = {}
+    pages_scanned = 0
+    rate_limited = False
+    last_portal_request_at = 0.0
     try:
         for term_index, term in enumerate(terms, start=1):
             for search_location in locations:
@@ -1009,12 +1022,19 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
                 while True:
                     portal_page += 1
                     try:
+                        wait_seconds = 1.0 - (time.monotonic() - last_portal_request_at)
+                        if wait_seconds > 0:
+                            await asyncio.sleep(wait_seconds)
                         page_offers = await asyncio.to_thread(fetch_pracuj_jobs, term, search_location, portal_page)
+                        last_portal_request_at = time.monotonic()
                     except RuntimeError as exc:
+                        last_portal_request_at = time.monotonic()
                         if portal_page == 1:
                             LOGGER.warning("Pracuj.pl search request failed (term=%d/%d page=%d location=%s): %s", term_index, len(terms), portal_page, search_location or "all", str(exc))
                         elif "HTTP 404" not in str(exc):
                             LOGGER.warning("Pracuj.pl pagination stopped after %d pages (term=%d/%d location=%s): %s", portal_page - 1, term_index, len(terms), search_location or "all", str(exc))
+                        if "HTTP 429" in str(exc):
+                            rate_limited = True
                         break
                     pages_scanned += 1
                     current_ids = {str(item.id) for item in page_offers}
@@ -1031,11 +1051,18 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
                         offers_by_id.setdefault(str(offer.id), offer)
                     if portal_page == 1 or portal_page % 3 == 0:
                         await status.edit_text(format_ui("search_page_progress", language, pages=pages_scanned, count=len(offers_by_id)))
+                if rate_limited:
+                    break
+            if rate_limited:
+                break
 
         offers = list(offers_by_id.values())
         if not offers:
             save_search_results([])
-            await status.edit_text(translate_ui_text("Nie udało się pobrać ofert z Pracuj.pl. Portal może blokować automatyczny odczyt albo nie ma wyników dla tych stanowisk.", language))
+            if rate_limited:
+                await status.edit_text(translate_ui_text("Pracuj.pl ograniczył liczbę żądań. Poczekaj chwilę przed kolejnym wyszukiwaniem.", language))
+            else:
+                await status.edit_text(translate_ui_text("Nie udało się pobrać ofert z Pracuj.pl. Portal może blokować automatyczny odczyt albo nie ma wyników dla tych stanowisk.", language))
             return
         all_ranked: list[dict[str, object]] = []
         batches = [offers[i:i + 5] for i in range(0, len(offers), 5)]
@@ -1054,7 +1081,10 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
     save_search_results(all_ranked)
     elapsed = time.monotonic() - search_started
     LOGGER.info("Pracuj search completed: terms=%d pages=%d offers=%d qualified=%d elapsed_seconds=%.2f", len(terms), pages_scanned, len(offers), len(all_ranked), elapsed)
-    await status.edit_text(format_ui("search_finished", language, pages=pages_scanned, count=len(offers), qualified=len(all_ranked), seconds=elapsed))
+    completion_text = format_ui("search_finished", language, pages=pages_scanned, count=len(offers), qualified=len(all_ranked), seconds=elapsed)
+    if rate_limited:
+        completion_text += "\n\n" + translate_ui_text("Pracuj.pl ograniczył liczbę żądań. Pokazuję dotychczas zebrane oferty; spróbuj ponownie później.", language)
+    await status.edit_text(completion_text)
     await _send_ranked_jobs(message, all_ranked, 1)
 
 
