@@ -90,6 +90,10 @@ class JobOffer(StrictModel):
     salary: str | None = None
     work_mode: str | None = None
     source: str = "Pracuj.pl"
+    source_id: str = "unknown"
+    country_code: str | None = None
+    language_code: str | None = None
+    fetched_at: str | None = None
 
 
 class JobFit(StrictModel):
@@ -351,7 +355,8 @@ def _matching_profile(profile: dict[str, Any]) -> dict[str, Any]:
 def _offer_matching_evidence(offer: JobOffer) -> dict[str, Any]:
     data = offer.model_dump(mode="json")
     return {key: data.get(key) for key in (
-        "id", "title", "company", "location", "description", "employment_type", "salary", "work_mode", "source",
+        "id", "title", "company", "location", "description", "employment_type", "salary", "work_mode",
+        "source", "source_id", "country_code", "language_code",
     )}
 
 

@@ -2,6 +2,10 @@
 
 Telegramowy asystent rekrutacyjny: zapisuje CV lokalnie, przygotowuje profil po zgodzie użytkownika, pomaga wyszukiwać i oceniać oferty Pracuj.pl oraz przygotowuje szkice odpowiedzi do aplikacji.
 
+## Źródła ofert
+
+Integracje portali korzystają ze wspólnego modelu `JobOffer` i logiki oceny dopasowania. Kontrakt adaptera znajduje się w `job_sources.py`; obecnie zarejestrowanym źródłem jest `pracuj_pl`. Adapter obsługuje wyszukiwanie stron wyników i uzupełnianie szczegółów, a obecna implementacja HTTP/parsera Pracuj.pl pozostaje w `career_features.py`. Nowe źródła należy dodawać jako osobne adaptery z własnymi ustawieniami kraju, języka i locale. Dostęp do źródła musi być zgodny z jego warunkami i limitami.
+
 ## Konfiguracja
 
 Dodaj lokalnie do pliku `.env` wartości `OPENAI_API_KEY` i `TELEGRAM_BOT_TOKEN`. Plik jest ignorowany przez Git. Nie umieszczaj kluczy w kodzie. `TELEGRAM_OWNER_ID` nie jest wymagany do normalnej pracy; jest używany wyłącznie do przypisania danych z dawnego układu podczas migracji.

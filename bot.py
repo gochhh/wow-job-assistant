@@ -39,10 +39,7 @@ from bot_language import (
 from career_features import (
     JobOffer,
     assess_application_fields,
-    build_search_url,
     delete_profile_record,
-    fetch_pracuj_jobs,
-    enrich_pracuj_offer,
     get_profile_record,
     get_search_results,
     list_profiles,
@@ -58,6 +55,7 @@ from career_features import (
     update_active_profile,
     user_cv_dir,
 )
+from job_sources import get_job_source
 
 _last_pracuj_detail_request_at = 0.0
 _ACTIVE_JOB_SEARCHES: dict[int, asyncio.Task] = {}
@@ -1061,7 +1059,10 @@ async def _send_ranked_jobs(message, ranked: list[dict[str, object]], page: int,
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
             try:
-                detailed = await asyncio.to_thread(enrich_pracuj_offer, JobOffer.model_validate(offer))
+                source_id = str(offer.get("source_id") or "pracuj_pl")
+                detailed = await asyncio.to_thread(
+                    get_job_source(source_id).enrich, JobOffer.model_validate(offer)
+                )
                 offer.update(detailed.model_dump(mode="json"))
                 row["offer"] = offer
                 save_search_results(user_id, ranked)
@@ -1179,6 +1180,7 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
         await message.reply_text("Najpierw zapisz aktywny profil poleceniem /analyze.")
         return
     profile = active[2]
+    job_source = get_job_source("pracuj_pl")
     language = _ui_language_from_message(message)
     status = await message.reply_text(translate_ui_text("Rozpoczynam wyszukiwanie ofert na Pracuj.pl. Sprawdzę kolejne strony i zbliżone nazwy stanowisk.", language))
     _ACTIVE_JOB_SEARCH_STATUSES[user_id] = status
@@ -1208,7 +1210,7 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
         await status.edit_text(translate_ui_text("Dopasowuję nazwy stanowisk i miast do zapisu używanego przez Pracuj.pl…", language))
         related_titles, normalized_locations = await expand_job_search_inputs(
             user_id, profile.model_dump(mode="json"), language, locations_to_normalize,
-            portal_locale="pl-PL", portal_country="Poland",
+            portal_locale=job_source.search_locale, portal_country=job_source.country_name,
         )
         terms = _job_search_terms(profile, query, related_titles)
         if len(normalized_locations) == len(locations_to_normalize):
@@ -1234,7 +1236,9 @@ async def _run_job_search(message, context: ContextTypes.DEFAULT_TYPE, query: st
                         wait_seconds = 1.0 - (time.monotonic() - last_portal_request_at)
                         if wait_seconds > 0:
                             await asyncio.sleep(wait_seconds)
-                        page_offers = await asyncio.to_thread(fetch_pracuj_jobs, term, search_location, portal_page)
+                        page_offers = await asyncio.to_thread(
+                            job_source.search_page, term, search_location, portal_page
+                        )
                         last_portal_request_at = time.monotonic()
                     except RuntimeError as exc:
                         last_portal_request_at = time.monotonic()
